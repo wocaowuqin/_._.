@@ -4,7 +4,7 @@ project:
   description: "Hierarchical Reinforcement Learning for Service Function Chaining"
   base_dir: "./outputs"  # 基础输出目录
   input_dir: "E:\pycharmworkspace\SFC-master\HRL-GNN for Multicast-aware SFC Orchestration\data\input_dir"
-  output_dir: "E:\\pycharmworkspace\\SFC-master\\HIRL-MSFC-CE\\out_hirl"
+  output_dir: "E:\pycharmworkspace\SFC-master\HRL-GNN for Multicast-aware SFC Orchestration\data\out_hirl"
 
 environment:
   num_nodes: 28

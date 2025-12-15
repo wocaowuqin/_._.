@@ -125,7 +125,14 @@ class PolicyHelper:
                 feasible = True
             else:
                 failure_reason = "resource_exhausted"
-
+        # 3.记录专家动作（用于 DAgger）
+        if feasible and not backup_used:
+            # 记录专家选择的动作
+            action = i_idx * self.K_path + k_idx
+            self.last_expert_action = action
+        else:
+            # 如果失败或使用备份，标记为无效
+            self.last_expert_action = -1
         return feasible, plan, backup_used, failure_reason
 
     # =========================================================================
@@ -230,7 +237,6 @@ class PolicyHelper:
                     valid_actions.append(action_id)
 
         return valid_actions if valid_actions else [0]
-
     def _get_path_for_i_idx(self, path_manager, current_tree, request, i_idx: int) -> List[int]:
         """根据索引从 PathManager 获取具体路径列表"""
         if not current_tree or not current_tree['paths_map']:
@@ -243,7 +249,6 @@ class PolicyHelper:
                 return path_manager.get_path(0)
             return [request['source']]
         return path
-
     # =========================================================================
     # 辅助功能：掩码计算 (Masks)
     # =========================================================================
@@ -271,7 +276,6 @@ class PolicyHelper:
         return high_mask, low_mask
 
     # envs/modules/policy_helper.py
-
     def get_expert_high_level_labels(self, request, network_state, unadded_dests,
                                      current_tree, nodes_on_tree, top_k=5):
         """
@@ -288,10 +292,64 @@ class PolicyHelper:
         scores = [float(c[1]) for c in cands]
         return ids, scores, ids[0]
 
-    def expert_low_level_action(self):
+    def decode_low_level_action(self, action: int, max_paths: int = 10) -> Tuple[int, int]:
         """
-        [遗漏补充] 返回上一步专家推荐的低层动作 (用于 DAgger 奖励)
-        注意：这需要在 get_best_plan 中记录 self.last_expert_action
+        解码低层动作为 (i_idx, k_idx)
+
+        公式: action = i_idx * K_path + k_idx
+
+        Args:
+            action: 动作编号
+            max_paths: 最大路径数（MAX_PATHS_IN_TREE）
+
+        Returns:
+            (i_idx, k_idx): 路径索引和 k-path 索引
         """
-        # 简单实现：如果没有记录，返回 -1
+        k_idx = int(action % self.K_path)
+        i_idx = int(action // self.K_path)
+
+        # 限制在有效范围
+        i_idx = i_idx % max_paths
+
+        return i_idx, k_idx
+    def get_high_level_candidate_mask(self, candidates: List[Tuple[int, float]]) -> np.ndarray:
+        """生成高层候选动作掩码"""
+        mask = np.zeros(self.NB_HIGH_LEVEL_GOALS, dtype=np.float32)
+        for dest_idx, _ in candidates:
+            if 0 <= dest_idx < self.NB_HIGH_LEVEL_GOALS:
+                mask[dest_idx] = 1.0
+        return mask
+
+    def get_low_level_action_mask(self, path_manager, current_tree,
+                                  num_actions: int) -> np.ndarray:
+        """
+        生成低层动作掩码（用于 Agent）
+
+        Args:
+            path_manager: 路径管理器
+            current_tree: 当前树结构
+            num_actions: 总动作数（NB_LOW_LEVEL_ACTIONS）
+
+        Returns:
+            mask: [num_actions] 布尔掩码，1=有效动作，0=无效动作
+        """
+        mask = np.zeros(num_actions, dtype=np.float32)
+
+        # 获取有效动作列表
+        valid_actions = self.get_valid_low_level_actions(path_manager, current_tree)
+
+        for action in valid_actions:
+            if 0 <= action < num_actions:
+                mask[action] = 1.0
+
+        return mask
+    def expert_low_level_action(self) -> int:
+        """
+        返回上一步专家推荐的低层动作（用于 DAgger 奖励）
+
+        注意：需要在 get_best_plan() 中记录 self.last_expert_action
+
+        Returns:
+            action: 专家动作索引，-1 表示无法获取
+        """
         return getattr(self, 'last_expert_action', -1)

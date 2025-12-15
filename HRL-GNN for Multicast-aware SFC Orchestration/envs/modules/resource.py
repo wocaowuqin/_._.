@@ -2,11 +2,9 @@
 ==================================================
 NFV-Oriented HRL-GNN Resource Management Module
 ==================================================
-
 本文件定义了 NFV 在线资源编排系统中的资源管理与状态抽象组件，
 用于支持基于图神经网络（GNN）与分层强化学习（HRL）的
 服务功能链（SFC）部署与多播编排任务。
-
 --------------------------------------------------
 文件功能概述
 --------------------------------------------------
@@ -16,26 +14,20 @@ NFV-Oriented HRL-GNN Resource Management Module
 3. 为强化学习 Agent 构造可学习的状态表示（Flat State）
 4. 为 Expert / Backup Policy 提供结构化网络状态
 5. 支持 VNF 共享、多播树扩展等高级 NFV 场景
-
 该文件不包含：
 - 强化学习策略本身
 - 奖励函数设计
 - Episode / Step 调度逻辑
-
 --------------------------------------------------
 类说明
 --------------------------------------------------
 """
-
 import numpy as np
 import networkx as nx
 import torch
 import logging
 from typing import Dict, Set, Optional, Tuple, List
-
 logger = logging.getLogger(__name__)
-
-
 class ResourceManager:
     """
     ResourceManager（资源管理器）
@@ -125,8 +117,6 @@ class ResourceManager:
     唯一可信的资源状态来源。
     """
 
-    # envs/modules/resource.py
-
     def __init__(self, topo: np.ndarray, capacities: Dict, dc_nodes: List[int], link_map: Optional[Dict] = None):
         """
         初始化资源管理器
@@ -143,7 +133,7 @@ class ResourceManager:
         self.K_vnf = 5
 
         # 保存 DC 节点集合
-        self.dc_nodes = set(dc_nodes)
+        self.dc_nodes = list(dc_nodes)
 
         # 🔥 [修复] 初始化 link_map，防止 _build_edge_index 报错
         self.link_map = link_map
@@ -174,7 +164,6 @@ class ResourceManager:
 
         # 🔥 [修复] 必须在 self.link_map 初始化之后调用
         self._build_edge_index()
-
     def apply_deployment(self, request: Dict, plan: Dict):
         """应用部署方案，扣除资源"""
         tree_branch = plan.get('tree', np.zeros(self.L))
@@ -197,7 +186,6 @@ class ResourceManager:
                 except:
                     pass
             self.hvt_all[node, vnf_t] += 1
-
     def _build_shortest_dist_matrix(self):
         """构建最短路矩阵 (简单版，用于Progress计算)"""
         self.shortest_dist = np.full((self.n, self.n), 9999.0)
@@ -206,7 +194,6 @@ class ResourceManager:
         # G = nx.from_numpy_array(self.topo)
         # dict_len = dict(nx.all_pairs_dijkstra_path_length(G))
         # ... 填充矩阵
-
     def can_share_vnf(self, node_id: int, vnf_type: int) -> bool:
         """对应 can_share_vnf (逻辑略作解耦)"""
         node_idx = node_id - 1
@@ -219,7 +206,6 @@ class ResourceManager:
         if key in self.vnf_sharing_map:
             return len(self.vnf_sharing_map[key]) < 3
         return True
-
     def find_closest_tree_node(self, nodes_on_tree: set, goal_node: int, source_node: int):
         """对应 _find_closest_tree_node_to_goal"""
         if not nodes_on_tree:
@@ -234,14 +220,31 @@ class ResourceManager:
                 min_dist = dist
                 closest = node
         return closest
-
     def get_shortest_distance(self, src: int, dst: int) -> float:
-        if src == dst: return 0.0
-        s, d = src - 1, dst - 1
-        if 0 <= s < self.n and 0 <= d < self.n:
-            return float(self.shortest_dist[s, d])
-        return 9999.0
+        """
+        获取两节点间的最短距离
 
+        Args:
+            src: 源节点 (1-based)
+            dst: 目标节点 (1-based)
+
+        Returns:
+            distance: 最短距离
+        """
+        if src == dst:
+            return 0.0
+
+        # 转换为 0-based 索引
+        src_idx = src - 1 if src > 0 else 0
+        dst_idx = dst - 1 if dst > 0 else 0
+
+        # 检查索引有效性
+        if 0 <= src_idx < self.n and 0 <= dst_idx < self.n:
+            return float(self.shortest_dist[src_idx, dst_idx])
+
+        # 无效索引，返回无穷大
+        logger.warning(f"Invalid node indices: src={src}, dst={dst}")
+        return 9999.0
     def get_flat_state(self, current_request: Optional[Dict],
                        unadded_dest_indices: Set[int],
                        nodes_on_tree: Set[int],
@@ -303,10 +306,6 @@ class ResourceManager:
         final_state[self.dim_network:] = req_vec
 
         return final_state
-
-    # ===============================================================
-    # 资源操作方法 (保持不变，供 Env 调用)
-    # ===============================================================
     def get_network_state_dict(self, current_request=None):
         """对应 _get_network_state_dict"""
         state = {
@@ -356,7 +355,6 @@ class ResourceManager:
         if key not in self.vnf_sharing_map:
             self.vnf_sharing_map[key] = set()
         self.vnf_sharing_map[key].add(dest_idx)
-
     def _build_edge_index(self):
         """构建 PyTorch Geometric 所需的 edge_index"""
         rows, cols = np.where(self.topo > 0)
@@ -381,7 +379,6 @@ class ResourceManager:
 
         self.edge_index = torch.tensor(np.array(edge_list).T, dtype=torch.long)
         self.edge_hops = torch.tensor([float(self.topo[u, v]) for u, v in zip(rows, cols)], dtype=torch.float32)
-
     def get_graph_state(self, current_request, nodes_on_tree, current_tree,
                         served_dest_count: int, sharing_strategy: int, nb_high_goals: int):
         """
@@ -466,7 +463,6 @@ class ResourceManager:
         req_vec = torch.tensor(req_vec, dtype=torch.float32)
 
         return x, self.edge_index, edge_attrs, req_vec
-
     def _compute_dest_distances(self, dest_set):
         key = frozenset(dest_set)
         if key in self._dest_dist_cache: return self._dest_dist_cache[key]
@@ -480,7 +476,6 @@ class ResourceManager:
 
         self._dest_dist_cache[key] = avg_dist
         return avg_dist
-
     def _compute_vnf_sharing_potential(self, dest_set):
         avg_dist = self._compute_dest_distances(dest_set)
         dist_factor = 1.0 - avg_dist / (np.max(avg_dist) + 1e-5)
@@ -488,3 +483,70 @@ class ResourceManager:
 
         potential = 0.4 * dist_factor + 0.3 * resource_factor  # 简化计算
         return np.clip(potential, 0, 1)
+    def _compute_progress(self, goal_dest_idx: int) -> float:
+        """
+        计算当前步进的进度值
+
+        进度 ∈ [-1, 1]:
+        - 正数：更接近目标（好）
+        - 负数：离目标更远（坏）
+        """
+        try:
+            if not self.current_request:
+                return 0.0
+
+            dest_list = self.current_request.get('dest', [])
+            if goal_dest_idx >= len(dest_list):
+                return 0.0
+
+            goal_node = dest_list[goal_dest_idx]
+
+            # 获取当前位置（树中最近的节点）
+            if hasattr(self, 'nodes_on_tree') and self.nodes_on_tree:
+                current_node = self.resource_mgr.find_closest_tree_node(
+                    self.nodes_on_tree,
+                    goal_node,
+                    self.current_request.get('source', 1)
+                )
+            else:
+                current_node = self.current_request.get('source', 1)
+
+            # 获取当前距离
+            current_dist = self.resource_mgr.get_shortest_distance(current_node, goal_node)
+
+            # 获取上一步的距离
+            prev_dist = getattr(self, '_prev_dist', current_dist)
+            self._prev_dist = current_dist
+
+            # 第一次调用，返回 0
+            if prev_dist == current_dist and not hasattr(self, '_progress_initialized'):
+                self._progress_initialized = True
+                return 0.0
+
+            # 计算进度
+            if prev_dist == 0:
+                return 1.0 if current_dist == 0 else -1.0
+
+            progress = (prev_dist - current_dist) / max(1, prev_dist)
+            return float(np.clip(progress, -1.0, 1.0))
+
+        except Exception as e:
+            logger.debug(f"_compute_progress error: {e}")
+            return 0.0
+    def _compute_qos_violation(self) -> Optional[Dict[str, float]]:
+        """计算 QoS 违规情况"""
+        violations = {}
+
+        # 延迟违规
+        if hasattr(self, 'current_delay') and hasattr(self, 'delay_threshold'):
+            if self.current_delay > self.delay_threshold:
+                violations['delay'] = min(1.0,
+                                          (self.current_delay - self.delay_threshold) / max(1, self.delay_threshold))
+
+        # 带宽违规
+        if hasattr(self, 'current_bw_usage') and hasattr(self, 'bw_threshold'):
+            if self.current_bw_usage > self.bw_threshold:
+                violations['bandwidth'] = min(1.0,
+                                              (self.current_bw_usage - self.bw_threshold) / max(1, self.bw_threshold))
+
+        return violations if violations else None
