@@ -14,8 +14,8 @@ from pathlib import Path
 import numpy as np
 
 # --- 1. 路径和环境配置（保持不变）---
-INPUT_DIR = Path(r'E:\pycharmworkspace\SFC-master\HIRL-MSFC-CE (1)\generate_requests_depend_on_poisson\data_output')
-OUTPUT_DIR = Path(r'E:\pycharmworkspace\SFC-master\HIRL-MSFC-CE (1)\out_hirl')
+INPUT_DIR = Path(r'E:\pycharmworkspace\SFC-master\HIRL-MSFC-CE\generate_requests_depend_on_poisson\data_output')
+OUTPUT_DIR = Path(r'E:\pycharmworkspace\SFC-master\HIRL-MSFC-CE\out_hirl')
 
 CAPACITIES = {
     'cpu': 80.0,

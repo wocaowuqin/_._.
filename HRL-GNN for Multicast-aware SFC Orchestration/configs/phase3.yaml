@@ -1,0 +1,50 @@
+# 阶段3配置 - 强化学习微调
+phase3:
+  output_dir: "${project.base_dir}/phase3"
+  episodes: 300  # 与EPISODE_LIMIT一致
+  max_steps: 3000000  # 总步数限制（STEPS_LIMIT）
+  start_epsilon: 0.3  # 与EPSILON_CONFIG.initial一致
+  max_steps_per_episode: 120
+  eval_every: 100
+  eval_episodes: 20
+  save_every: 100
+
+  # 探索策略（Epsilon配置）
+  epsilon:
+    initial: 0.3
+    final: 0.02
+    decay_steps: 1000000  # 与EXPLORATION_STEPS一致
+
+  # DAgger配置（模仿学习与探索结合）
+  dagger:
+    initial_beta: 0.8
+    final_beta: 0.05
+    decay_steps: 3000000  # 与STEPS_LIMIT一致
+
+  # 早停策略
+  early_stopping:
+    enabled: true
+    patience: 50  # 50个episode无提升则停止
+    min_improvement: 0.01  # 至少1%的提升
+
+  # 检查点配置
+  checkpoint:
+    save_freq: 25  # 每25个episode保存一次
+    keep_best: true
+    metric: "acceptance_rate"  # 以接受率为评估标准
+
+  # 课程学习配置
+  curriculum:
+    use_curriculum: true
+    stages: 3
+    initial_expert_ratio: 0.8
+    final_expert_ratio: 0.0
+    epsilon_decay: 0.995
+
+  # RL特定参数
+  rl:
+    gamma: 0.99  # 折扣因子
+    replay_buffer:
+      capacity: 100000
+      batch_size: 32
+    target_update_freq: 10  # 目标网络更新频率

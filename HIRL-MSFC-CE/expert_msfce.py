@@ -756,11 +756,12 @@ class MSFCE_Solver:
     def _apply_path_to_tree_with_rollback(self, tree_struct, info, request, state,
                                           real_deploy=False, resource_delta=None) -> bool:
         """Rollback 机制"""
-        original_state = {
-            'cpu': state['cpu'].copy(),
-            'mem': state['mem'].copy(),
-            'bw': state['bw'].copy()
-        }
+        # 🔥 修复：使用 copy.deepcopy 而不是 .copy()，支持 tuple/list/dict/ndarray
+        original_state = copy.deepcopy({
+            'cpu': state['cpu'],
+            'mem': state['mem'],
+            'bw': state['bw']
+        })
         original_tree = {
             'tree': tree_struct['tree'].copy(),
             'hvt': tree_struct['hvt'].copy(),
@@ -1179,6 +1180,46 @@ class MSFCE_Solver:
         self.metrics['total_requests'] += 1
 
         try:
+            # 🔥🔥🔥 关键修复：State 类型检查和转换 🔥🔥🔥
+            if network_state is None:
+                logger.error("[Expert] network_state is None!")
+                self.metrics['rejected'] += 1
+                return None, []
+
+            # 如果是 tuple 或 list，转换为 dict
+            if isinstance(network_state, (tuple, list)):
+                logger.warning(f"[Expert] Converting {type(network_state).__name__} to dict")
+                if len(network_state) >= 3:
+                    import numpy as np
+                    network_state = {
+                        'cpu': np.array(network_state[0]) if not isinstance(network_state[0], np.ndarray) else
+                        network_state[0],
+                        'mem': np.array(network_state[1]) if not isinstance(network_state[1], np.ndarray) else
+                        network_state[1],
+                        'bw': np.array(network_state[2]) if not isinstance(network_state[2], np.ndarray) else
+                        network_state[2],
+                    }
+                else:
+                    logger.error(f"[Expert] Invalid state format: tuple/list length < 3")
+                    self.metrics['rejected'] += 1
+                    return None, []
+
+            # 确保是 dict
+            if not isinstance(network_state, dict):
+                logger.error(f"[Expert] network_state must be dict, got {type(network_state)}")
+                self.metrics['rejected'] += 1
+                return None, []
+
+            # 确保资源数组支持 .copy() 方法
+            import numpy as np
+            for key in ['cpu', 'mem', 'bw']:
+                if key in network_state:
+                    if isinstance(network_state[key], (tuple, list)):
+                        network_state[key] = np.array(network_state[key])
+                    elif not isinstance(network_state[key], np.ndarray):
+                        network_state[key] = np.array(network_state[key])
+            # 🔥🔥🔥 修复结束 🔥🔥🔥
+
             network_state = self._normalize_state(network_state)
             network_state['request'] = request
 
@@ -1215,6 +1256,7 @@ class MSFCE_Solver:
             self.metrics['errors'] += 1
             self.metrics['rejected'] += 1
             return None, []
+
 
 
 if __name__ == "__main__":

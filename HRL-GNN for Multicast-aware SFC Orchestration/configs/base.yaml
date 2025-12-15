@@ -1,0 +1,22 @@
+# 基础配置 - 全局共享参数
+project:
+  name: "HIRL-MSFC-CE"
+  description: "Hierarchical Reinforcement Learning for Service Function Chaining"
+  base_dir: "./outputs"  # 基础输出目录
+  input_dir: "E:\pycharmworkspace\SFC-master\HRL-GNN for Multicast-aware SFC Orchestration\data\input_dir"
+  output_dir: "E:\\pycharmworkspace\\SFC-master\\HIRL-MSFC-CE\\out_hirl"
+
+environment:
+  num_nodes: 28
+  dc_nodes: [1, 2, 3, 4, 5, 6, 7, 8, 11, 13, 14, 17, 18, 19, 20, 21, 23, 24, 27, 28]  # 扩展DC节点列表
+  capacities:
+    cpu: 80.0
+    memory: 60.0
+    bandwidth: 80.0
+  use_gnn: true
+  topology_matrix:  # 拓扑矩阵可保留引用，实际使用时加载numpy数组
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "${project.base_dir}/training.log"

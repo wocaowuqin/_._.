@@ -37,10 +37,8 @@ except ImportError:
 # ----------------------------------------------------
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-
 # ----------------------------------------------------
-# PathManager
+# PathManager->已完成
 # ----------------------------------------------------
 class PathManager:
     """独立的路径管理器, 确保路径索引的一致性"""
@@ -75,8 +73,6 @@ class PathManager:
 
     def __len__(self):
         return len(self.paths)
-
-
 # ----------------------------------------------------
 # SFC_HIRL_Env (Fixed & Optimized & Integrated)
 # ----------------------------------------------------
@@ -87,7 +83,6 @@ class SFC_HIRL_Env(gym.Env):
     ✅ 修复资源状态类型兼容性
     ✅ 修复 AttributeError: set_tree -> set_current_tree
     """
-
     def __init__(self, input_dir: Path, topo: np.ndarray, dc_nodes: List[int], capacities: Dict):
         super(SFC_HIRL_Env, self).__init__()
 
@@ -96,7 +91,8 @@ class SFC_HIRL_Env(gym.Env):
         # =========================================================
         # [新增] 配置你的输出路径 (使用 raw string 防止转义)
         self.failure_output_dir = r"E:\pycharmworkspace\SFC-master\HIRL-MSFC-CE (1)\out_failue"
-
+        # [新增] 保存 input_dir，供后续 load_dataset 使用
+        self.input_dir = input_dir
         # 自动创建文件夹
         import os
         os.makedirs(self.failure_output_dir, exist_ok=True)
@@ -110,7 +106,7 @@ class SFC_HIRL_Env(gym.Env):
         # 必须最先初始化，因为它决定了 self.n (节点数) 和 self.L (链路数)
         self.expert = MSFCE_Solver(input_dir / "US_Backbone_path.mat", topo, dc_nodes, capacities)
 
-        self.T = 400
+        self.T = 3000
         self.n, self.L, self.K_vnf = self.expert.node_num, self.expert.link_num, self.expert.type_num
         self.K_path = self.expert.k_path_count
 
@@ -209,20 +205,30 @@ class SFC_HIRL_Env(gym.Env):
         self._eval_cache = {}
         self.expert_randomness = 0.1
 
+        # ✅ [新增] 必须保存 input_dir
+        self.input_dir = input_dir
+
         try:
-            # 加载请求数据
-            req_path = input_dir / "sorted_requests.pkl"
+            # [Fix] 将默认文件名改为存在的 phase1 文件，防止初始化报错
+            req_path = input_dir / "phase1_requests.pkl"  # 原 sorted_requests.pkl
             if not req_path.exists():
-                raise FileNotFoundError(f"找不到请求文件: {req_path}")
+                # 回退尝试，兼容旧代码
+                req_path = input_dir / "sorted_requests.pkl"
+
+            if not req_path.exists():
+                raise FileNotFoundError(f"找不到请求文件: {req_path} (请确认目录下有 phase1_requests.pkl)")
 
             with open(req_path, 'rb') as f:
                 self.requests = pickle.load(f)
             self.req_map = {r['id']: r for r in self.requests}
 
-            # 加载事件数据
-            event_path = input_dir / "event_list.pkl"
+            # [Fix] 同理修改事件文件
+            event_path = input_dir / "phase1_events.pkl"  # 原 event_list.pkl
             if not event_path.exists():
-                raise FileNotFoundError(f"找不到事件文件: {event_path}")
+                event_path = input_dir / "event_list.pkl"
+
+            if not event_path.exists():
+                raise FileNotFoundError(f"找不到事件文件: {event_path} (请确认目录下有 phase1_events.pkl)")
 
             with open(event_path, 'rb') as f:
                 raw_events = pickle.load(f)
@@ -270,25 +276,225 @@ class SFC_HIRL_Env(gym.Env):
         self.action_space = spaces.Discrete(self.NB_HIGH_LEVEL_GOALS)
         self.observation_space = spaces.Box(low=0.0, high=1.0,
                                             shape=(self.STATE_VECTOR_SIZE,), dtype=np.float32)
-    # [新增] 获取备份统计指标的方法
-    def get_backup_metrics(self) -> Dict[str, float]:
-        """计算并返回备份策略的触发率和成功率"""
-        total = max(1, self.stats_total_subtasks)
-        activated = self.stats_backup_activated
 
-        # 触发率 = 备份次数 / 总任务数
-        activation_rate = (activated / total) * 100.0
+        # ----------------------------------------------------------------
+        # [新增] 动态加载数据集 (用于 Phase 1 / Phase 3 切换)
+        # ----------------------------------------------------------------
+        # hirl_sfc_env.py
 
-        # 成功率 = 备份成功次数 / 备份触发次数
-        # (分母用 max(1, activated) 防止除零)
-        success_rate = 0.0
-        if activated > 0:
-            success_rate = (self.stats_backup_succeeded / activated) * 100.0
+        # ==================== 👇 请完整插入以下两个方法 👇 ====================
 
-        return {
-            'activation_rate': activation_rate,
-            'success_rate': success_rate
-        }
+
+    def _compute_progress(self, goal_idx):
+        """
+        修复版 progress 计算
+
+        计算当前状态距离目标的改善程度，范围 [-1,1]
+        - 负数 = 离目标更远
+        - 正数 = 更接近目标
+
+        使用最短路径矩阵而不是 networkx（避免依赖问题）
+        """
+        try:
+            if not self.current_request:
+                return 0.0
+
+            dest_list = self.current_request.get('dest', [])
+            if goal_idx >= len(dest_list):
+                return 0.0
+
+            goal_node = dest_list[goal_idx]
+
+            # 获取当前位置（树中最近添加的节点）
+            if self.nodes_on_tree:
+                # 找到树中离目标最近的节点
+                current_node = self._find_closest_tree_node_to_goal(goal_node)
+            else:
+                current_node = self.current_request.get('source', 1)
+
+            # 使用预计算的最短路径矩阵
+            current_dist = self._shortest_distance(current_node, goal_node)
+
+            # 获取上一步的距离
+            prev_dist = getattr(self, "_prev_dist", current_dist)
+            self._prev_dist = current_dist
+
+            # 如果第一次调用，返回0
+            if prev_dist == current_dist and not hasattr(self, "_progress_initialized"):
+                self._progress_initialized = True
+                return 0.0
+
+            # 计算进度
+            if prev_dist == 0:
+                return 1.0 if current_dist == 0 else -1.0
+
+            progress = (prev_dist - current_dist) / max(1, prev_dist)
+            return float(np.clip(progress, -1.0, 1.0))
+
+        except Exception as e:
+            logger.debug(f"[_compute_progress] Error: {e}")
+            return 0
+    def _compute_qos_violation(self):
+        """
+        简易 QoS 违反检测：
+        返回形如 {"delay":0.2, "bandwidth":0.1}
+        所有值 ∈ [0,1]，表示违反比例
+        """
+        viol = {}
+
+        # ---- 延迟违反 ----
+        if hasattr(self, "current_delay") and hasattr(self, "delay_threshold"):
+            if self.current_delay > self.delay_threshold:
+                viol["delay"] = min(1.0, (self.current_delay - self.delay_threshold) / self.delay_threshold)
+
+        # ---- 带宽违反 ----
+        if hasattr(self, "current_bw_usage") and hasattr(self, "bw_threshold"):
+            if self.current_bw_usage > self.bw_threshold:
+                viol["bandwidth"] = min(1.0, (self.current_bw_usage - self.bw_threshold) / self.bw_threshold)
+
+        # ---- 丢包率违反 ----
+        if hasattr(self, "current_loss") and hasattr(self, "loss_threshold"):
+            if self.current_loss > self.loss_threshold:
+                viol["packet_loss"] = min(1.0, (self.current_loss - self.loss_threshold) / self.loss_threshold)
+
+        return viol if viol else None
+    def _compute_progress(self, goal_dest_idx):
+        """
+        progress ∈ [-1,1]
+        负数 = 离目标更远
+        正数 = 更接近目标
+        """
+        try:
+            dest_node = self.current_request["dest"][goal_dest_idx]
+            current_node = self.current_state_info.get("current_node", None)
+
+            if current_node is None or dest_node is None:
+                return 0.0
+
+            # 使用最短路径距离衡量进度
+            import networkx as nx
+            d_prev = nx.shortest_path_length(self.G, self.prev_node, dest_node) if hasattr(self, "prev_node") else None
+            d_now = nx.shortest_path_length(self.G, current_node, dest_node)
+
+            self.prev_node = current_node
+
+            if d_prev is None:
+                return 0.0
+
+            progress = (d_prev - d_now) / max(1, d_prev)
+            return float(np.clip(progress, -1.0, 1.0))
+
+        except:
+            return 0.0
+    def _clear_cache(self):
+        """资源状态改变时清空缓存"""
+        self._eval_cache.clear()
+    def _decode_low_level_action(self, action: int) -> Tuple[int, int]:
+        k_idx = int(action % self.K_path)
+        i_idx = int(action // self.K_path)
+        num_paths = max(1, len(self.path_manager))
+        i_idx = i_idx % min(num_paths, self.MAX_PATHS_IN_TREE)
+        return i_idx, k_idx
+
+    #load_dataset->data_loader.py
+    def load_dataset(self, requests_filename: str, events_filename: str):
+        """
+        [核心修复] 动态加载数据集，并强制重置环境时间
+        """
+        import pickle
+        import numpy as np
+
+        if not hasattr(self, 'input_dir'):
+            logger.error("[Env] input_dir not set! Check __init__.")
+            return False
+
+        req_path = self.input_dir / requests_filename
+        evt_path = self.input_dir / events_filename
+
+        try:
+            logger.info(f"[Env] Switching dataset to: {requests_filename}")
+
+            # 加载新请求
+            with open(req_path, 'rb') as f:
+                self.requests = pickle.load(f)
+            self.req_map = {r['id']: r for r in self.requests}
+
+            # 加载新事件
+            with open(evt_path, 'rb') as f:
+                raw_events = pickle.load(f)
+
+            self.events = []
+            for evt in raw_events:
+                # 兼容不同格式
+                arr = evt.get('arrive_event', evt.get('arrive', []))
+                lea = evt.get('leave_event', evt.get('leave', []))
+                self.events.append({
+                    'arrive': np.array(arr, dtype=int).flatten(),
+                    'leave': np.array(lea, dtype=int).flatten()
+                })
+
+            # 🔥🔥🔥 [关键修复] 强制重置时间指针 🔥🔥🔥
+            # 如果不加这行，Phase 3 会直接沿用 Phase 1 结束时的时间(例如200)，导致直接结束
+            self.t = 0
+            self.T = len(self.events)
+
+            # 重置所有统计和资源状态，确保 Phase 3 从零开始
+            self.total_requests_seen = 0
+            self.total_requests_accepted = 0
+            self.current_request = None
+            self.unadded_dest_indices = set()
+            self.served_requests = []
+            self.current_tree = None
+            self.nodes_on_tree = set()
+            if hasattr(self, 'path_manager'):
+                self.path_manager.reset()
+
+            # 重置网络资源
+            self.B = np.full(self.L, self.B_cap, dtype=float)
+            self.C = np.full(self.n, self.C_cap, dtype=float)
+            self.M = np.full(self.n, self.M_cap, dtype=float)
+            self.hvt_all = np.zeros((self.n, self.K_vnf), dtype=int)
+            self.link_ref_count = np.zeros(self.L, dtype=int)
+
+            logger.info(f"[Env] Dataset loaded! Count: {len(self.requests)}. Time reset to t=0, T={self.T}")
+            return True
+        except Exception as e:
+            logger.error(f"[Env] Failed to load dataset: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    #reset->ResourceManager
+    #_get_flat_state->ResourceManager
+    #_build_shortest_dist_matrix->ResourceManager
+    # _apply_deployment->ResourceManager
+    def _apply_deployment(self, request: Dict, plan: Dict):
+        """应用部署方案到网络状态（带防御性检查）"""
+        tree_branch = plan.get('tree', np.zeros(self.L))
+        hvt_branch = plan.get('hvt', np.zeros((self.n, self.K_vnf)))
+        self.current_tree['tree'] = np.logical_or(self.current_tree['tree'], tree_branch).astype(float)
+
+        bw_req = float(request.get('bw_origin', 0.0))
+
+        # 链路资源扣除：当引用计数为0时才真正扣带宽，然后无论如何引用计数+1
+        for link_idx in np.where(tree_branch > 0)[0]:
+            if self.link_ref_count[link_idx] == 0:
+                # 防御性：不要把带宽扣到负值
+                new_bw = self.B[link_idx] - bw_req
+                self.B[link_idx] = max(0.0, new_bw)
+            self.link_ref_count[link_idx] += 1
+
+        # 节点资源扣除（保持原有语义）
+        for node, vnf_t in np.argwhere(hvt_branch > 0):
+            if self.hvt_all[node, vnf_t] == 0:
+                try:
+                    j = request['vnf'].index(int(vnf_t + 1))
+                    self.C[node] = max(0.0, self.C[node] - request['cpu_origin'][j])
+                    self.M[node] = max(0.0, self.M[node] - request['memory_origin'][j])
+                except Exception:
+                    pass
+            self.hvt_all[node, vnf_t] += 1
+
+        self.current_tree['hvt'] = np.maximum(self.current_tree['hvt'], hvt_branch)
     def _build_shortest_dist_matrix(self):
         """从 PathDB 构建最短距离矩阵"""
         self.shortest_dist = np.full((self.n, self.n), 9999.0)
@@ -311,29 +517,28 @@ class SFC_HIRL_Env(gym.Env):
                         pass
             logger.info("Successfully built shortest distance matrix from PathDB")
         except Exception as e:
-            logger.warning(f"Failed to build shortest_dist from PathDB: {e}")
+            logger.warning(f"Failed to build shortest_dist from PathDB: {e}")#
+    def reset(self):
+        """
+        [新增] Gym 标准 reset 方法
+        防止 main.py 调用 env.reset() 时意外破坏状态
+        """
+        # 如果时间耗尽，强制归零
+        if self.t >= self.T:
+            self.t = 0
+            self.current_request = None
 
-    def print_env_summary(self):
-        """打印环境统计指标"""
-        req_acc_rate = self.total_requests_accepted / max(1, self.total_requests_seen)
-        dest_acc_rate = self.total_dest_accepted / max(1, self.total_dest_seen)
-        logger.info("-" * 30)
-        logger.info(f"ENV SUMMARY (t={self.t}/{self.T})")
-        logger.info(
-            f"Requests: Seen={self.total_requests_seen}, Acc={self.total_requests_accepted} ({req_acc_rate:.2%})")
-        logger.info(f"Destinations: Seen={self.total_dest_seen}, Acc={self.total_dest_accepted} ({dest_acc_rate:.2%})")
-        logger.info("-" * 30)
+        req, state = self.reset_request()
 
-    def _clear_cache(self):
-        """资源状态改变时清空缓存"""
-        self._eval_cache.clear()
+        # 双重保险：如果 reset_request 依然返回 None，说明状态不对，强制归零重试
+        if req is None:
+            logger.warning("[Env] reset() got None. Forcing t=0 retry.")
+            self.t = 0
+            req, state = self.reset_request()
 
-    def _get_network_state_dict(self) -> Dict:
-        return {
-            'bw': self.B, 'cpu': self.C, 'mem': self.M,
-            'hvt': self.hvt_all, 'bw_ref_count': self.link_ref_count
-        }
+        return state
 
+        # ==================== 👆 插入结束 👆 ====================
     def _get_flat_state(self) -> np.ndarray:
         net_state = self._get_network_state_dict()
 
@@ -370,7 +575,41 @@ class SFC_HIRL_Env(gym.Env):
         final_state[:self.dim_network] = flat_net[:self.dim_network]
         final_state[self.dim_network:] = req_vec
         return final_state
+    def _get_network_state_dict(self) -> Dict:
+        return {
+            'bw': self.B, 'cpu': self.C, 'mem': self.M,
+            'hvt': self.hvt_all, 'bw_ref_count': self.link_ref_count
+        }
 
+    # [新增] 获取备份统计指标的方法
+    def get_backup_metrics(self) -> Dict[str, float]:
+        """计算并返回备份策略的触发率和成功率"""
+        total = max(1, self.stats_total_subtasks)
+        activated = self.stats_backup_activated
+
+        # 触发率 = 备份次数 / 总任务数
+        activation_rate = (activated / total) * 100.0
+
+        # 成功率 = 备份成功次数 / 备份触发次数
+        # (分母用 max(1, activated) 防止除零)
+        success_rate = 0.0
+        if activated > 0:
+            success_rate = (self.stats_backup_succeeded / activated) * 100.0
+
+        return {
+            'activation_rate': activation_rate,
+            'success_rate': success_rate
+        }
+    def print_env_summary(self):
+        """打印环境统计指标"""
+        req_acc_rate = self.total_requests_accepted / max(1, self.total_requests_seen)
+        dest_acc_rate = self.total_dest_accepted / max(1, self.total_dest_seen)
+        logger.info("-" * 30)
+        logger.info(f"ENV SUMMARY (t={self.t}/{self.T})")
+        logger.info(
+            f"Requests: Seen={self.total_requests_seen}, Acc={self.total_requests_accepted} ({req_acc_rate:.2%})")
+        logger.info(f"Destinations: Seen={self.total_dest_seen}, Acc={self.total_dest_accepted} ({dest_acc_rate:.2%})")
+        logger.info("-" * 30)
     def _handle_leave_events(self, t: int):
         if t >= len(self.events):
             return
@@ -411,18 +650,24 @@ class SFC_HIRL_Env(gym.Env):
         if len(self.served_requests) != len(remaining):
             self._clear_cache()
         self.served_requests = remaining
-
     def reset_request(self) -> Tuple[Optional[Dict], np.ndarray]:
         self._clear_cache()
         self.current_request = None
+        self._req_step_count = 0
+
+        # 🔥 [新增] 通知 Critic 新请求开始了 (让它清空 buffer)
+        self.reward_critic.on_new_request()
+
         while self.current_request is None and self.t < self.T:
             if self.t > 0:
                 self._handle_leave_events(self.t - 1)
+
             if self.t >= len(self.events):
-                self.t += 1
-                continue
+                break
+
             arrive_ids = self.events[self.t]['arrive']
             self.t += 1
+
             if arrive_ids.size > 0:
                 req_id = int(arrive_ids[0])
                 if req_id in self.req_map:
@@ -430,14 +675,15 @@ class SFC_HIRL_Env(gym.Env):
 
         if self.current_request is None:
             return None, self._get_flat_state()
-        # 🔥 新增: 初始化多目标集合
-        self.destination_set = set(self.current_request.get('dest', []))
-        self.served_destinations = set()
-        self.vnf_sharing_map = {}
 
+        # 初始化状态
         self.total_requests_seen += 1
-        self.total_dest_seen += len(self.current_request.get('dest', []))
-        self.unadded_dest_indices = set(range(len(self.current_request.get('dest', []))))
+        dests = self.current_request.get('dest', [])
+
+        self.destination_set = set(dests)
+        self.served_destinations = set()
+        self.unadded_dest_indices = set(range(len(dests)))
+
         self.current_tree = {
             'id': self.current_request['id'],
             'tree': np.zeros(self.L),
@@ -446,34 +692,22 @@ class SFC_HIRL_Env(gym.Env):
         }
         self.nodes_on_tree = set([self.current_request['source']])
         self.path_manager.reset()
+        self.current_req_is_perfect = True
 
-        # [修改] 调用正确的 BackupPolicy 接口 (set_tree -> set_current_tree)
-        if self.current_request:
+        # 设置超时 (防止死循环)
+        self._req_max_steps = max(5, len(dests) * 3)
+
+        if hasattr(self, 'backup_policy'):
             self.backup_policy.set_current_request(self.current_request)
-            self.backup_policy.set_current_tree(list(self.nodes_on_tree)) # 只传节点列表，不传{}
-            # -----------------------------------------------------------
-            # [新增] 2. 开始记录当前请求
-            # -----------------------------------------------------------
-            # 提取 VNF 链名称 (示例转换，如果你的 vnf 是数字列表)
-            vnf_chain_str = [f"VNF_{v}" for v in self.current_request.get('vnf', [])]
+            self.backup_policy.set_current_tree(list(self.nodes_on_tree))
 
-            self.metrics_logger.start_deployment(
-                request_id=f"REQ_{self.current_request['id']}",
-                vnf_chain=vnf_chain_str,
-                destinations=self.current_request.get('dest', [])
-            )
-        # -----------------------------------------------------------
-        # -----------------------------------------------------------
-        # [新增] 2. 开始记录当前请求
-        # -----------------------------------------------------------
-        # [修改] 调用 logger 时传入 t=self.t
         if hasattr(self, 'metrics_logger'):
-            vnf_chain_str = [f"VNF_{v}" for v in self.current_request.get('vnf', [])]
+            vnf_str = [f"VNF_{v}" for v in self.current_request.get('vnf', [])]
             self.metrics_logger.start_deployment(
                 request_id=f"REQ_{self.current_request['id']}",
-                vnf_chain=vnf_chain_str,
-                destinations=self.current_request.get('dest', []),
-                t=self.t  # <--- [新增] 必须加这一行，用于时间轴画图
+                vnf_chain=vnf_str,
+                destinations=dests,
+                t=self.t
             )
 
         return self.current_request, self._get_flat_state()
@@ -556,14 +790,12 @@ class SFC_HIRL_Env(gym.Env):
 
         limit = len(candidates_sorted) if top_k < 0 else min(top_k, len(candidates_sorted))
         return candidates_sorted[:max(1, limit)]
-
     def get_high_level_candidate_mask(self, candidates: List[Tuple[int, float]]) -> np.ndarray:
         mask = np.zeros(self.NB_HIGH_LEVEL_GOALS, dtype=np.float32)
         for d_idx, _ in candidates:
             if 0 <= d_idx < self.NB_HIGH_LEVEL_GOALS:
                 mask[d_idx] = 1.0
         return mask
-
     def get_expert_high_level_goal(self, state_vec: np.ndarray) -> int:
         cands = self.get_expert_high_level_candidates(state_vec, top_k=1)
         if cands:
@@ -571,7 +803,6 @@ class SFC_HIRL_Env(gym.Env):
         if self.unadded_dest_indices:
             return int(next(iter(self.unadded_dest_indices)))
         return 0
-
     def get_expert_high_level_labels(self, state_vec: np.ndarray, top_k: int = 5) -> Tuple[List[int], List[float], int]:
         cands = self.get_expert_high_level_candidates(state_vec, top_k=top_k)
         if not cands:
@@ -579,7 +810,6 @@ class SFC_HIRL_Env(gym.Env):
         ids = [int(c[0]) for c in cands]
         scores = [float(c[1]) for c in cands]
         return ids, scores, ids[0]
-
     def _get_path_for_i_idx(self, i_idx: int) -> List[int]:
         if not self.current_tree or not self.current_tree['paths_map']:
             return [self.current_request['source']] if self.current_request else [0]
@@ -589,7 +819,6 @@ class SFC_HIRL_Env(gym.Env):
                 return self.path_manager.get_path(0)
             return [self.current_request['source']] if self.current_request else [0]
         return path
-
     def get_valid_low_level_actions(self) -> List[int]:
         valid_actions = []
         if not self.current_tree or not self.current_tree['paths_map']:
@@ -605,338 +834,203 @@ class SFC_HIRL_Env(gym.Env):
                     if action_id < self.NB_LOW_LEVEL_ACTIONS:
                         valid_actions.append(action_id)
         return valid_actions if valid_actions else [0]
-
     def get_low_level_action_mask(self) -> np.ndarray:
         mask = np.zeros(self.NB_LOW_LEVEL_ACTIONS, dtype=np.float32)
         for a in self.get_valid_low_level_actions():
             if 0 <= a < self.NB_LOW_LEVEL_ACTIONS:
                 mask[a] = 1.0
         return mask
-
-    def _decode_low_level_action(self, action: int) -> Tuple[int, int]:
-        k_idx = int(action % self.K_path)
-        i_idx = int(action // self.K_path)
-        num_paths = max(1, len(self.path_manager))
-        i_idx = i_idx % min(num_paths, self.MAX_PATHS_IN_TREE)
-        return i_idx, k_idx
-
     def step_low_level(self, goal_dest_idx: int, low_level_action):
         """
-        增强版 step_low_level (All-in-One Integrated)：
-        - 核心逻辑：Expert → Backup → Deployment
-        - 智能奖励：RewardCritic
-        - 数据埋点：自动记录每一步的资源消耗、路径、失败原因到 VNFMetricsLogger
-        - 视觉诊断：仅在出现“部分失败”（Partial Failure）时自动保存可视化图像
-        - 全局统计：更新完全/部分成功率计数器
+        Low-level step: place one destination (or attempt to).
+
+        Returns:
+            state,
+            reward,            # 仅在 request 结束时非 0
+            sub_task_done,     # 本 step 是否成功完成一个目标
+            request_done       # 本请求是否结束
         """
         self._clear_cache()
+        self._req_step_count += 1
 
-        # ---- 解码行动 ----
-        if isinstance(low_level_action, tuple) and len(low_level_action) == 3:
+        # --------------------------------------------------
+        # 0. 动作解码
+        # --------------------------------------------------
+        if isinstance(low_level_action, tuple):
             i_idx, k_idx, placement = low_level_action
         else:
             i_idx, k_idx = self._decode_low_level_action(int(low_level_action))
             placement = {}
 
-        # [统计] 增加子任务计数 (用于计算部分成功率)
-        self.stats_total_subtasks += 1  # 原有计数器
-        self.stats_sub_total += 1  # 新增计数器 (Success Rate 计算用)
+        self.stats_total_subtasks += 1
 
-        k = k_idx + 1
-
-        # ---- 无效请求：直接结束 ----
+        # --------------------------------------------------
+        # 1. 非法动作处理（❗不终止请求）
+        # --------------------------------------------------
         if self.current_request is None or goal_dest_idx not in self.unadded_dest_indices:
-            done = not (self.unadded_dest_indices and self.current_request)
-            return self._get_flat_state(), 0.0, True, done
+            # 记录一次失败子任务
+            self.reward_critic.criticize(
+                sub_task_completed=False,
+                cost=1.0,
+                request_failed=False,
+                progress_to_goal=0.0,
+                backup_used=False,
+                failure_reason="invalid_action",
+                agent_action=int(low_level_action) if not isinstance(low_level_action, tuple) else -1
+            )
 
-        # ---- 网络状态准备 ----
+            # invalid action ≠ request done
+            return self._get_flat_state(), 0.0, False, False
+
+        # --------------------------------------------------
+        # 2. 准备网络状态
+        # --------------------------------------------------
         network_state = self._get_network_state_dict()
-        network_state['request'] = self.current_request
+        network_state["request"] = self.current_request
 
-        # ---- 执行过程变量初始化 ----
         feasible = False
         plan = None
         backup_used = False
-        backup_level = "primary"
         failure_reason = None
 
-        # ===============================
-        # 1) 尝试 Expert 计算
-        # ===============================
-        try:
-            if not self.current_tree['paths_map']:
-                # 直接构造第一条路径
-                eval_val, paths, tree, hvt, feasible, _, _, placement_expert = \
-                    self.expert._calc_eval(self.current_request, goal_dest_idx, k, network_state)
+        k = k_idx + 1
 
+        # --------------------------------------------------
+        # 3. Expert / Backup 尝试
+        # --------------------------------------------------
+        try:
+            if not self.current_tree["paths_map"]:
+                eval_val, paths, tree, hvt, feasible, _, _, placement_expert = \
+                    self.expert._calc_eval(
+                        self.current_request, goal_dest_idx, k, network_state
+                    )
                 if feasible:
                     plan = {
-                        'tree': tree,
-                        'hvt': hvt,
-                        'new_path_full': paths,
-                        'feasible': True,
-                        'placement': placement_expert
+                        "tree": tree,
+                        "hvt": hvt,
+                        "new_path_full": paths,
+                        "placement": placement_expert
                     }
-
             else:
                 conn_path = self._get_path_for_i_idx(i_idx)
-                plan, eval_val, action, _ = self.expert._calc_atnp(
-                    self.current_tree, conn_path, goal_dest_idx, network_state, self.nodes_on_tree
+                plan, _, _, _ = self.expert._calc_atnp(
+                    self.current_tree,
+                    conn_path,
+                    goal_dest_idx,
+                    network_state,
+                    self.nodes_on_tree
                 )
-                feasible = plan.get('feasible', False) if isinstance(plan, dict) else False
+                feasible = plan.get("feasible", False) if plan else False
 
-        except Exception as e:
-            logger.warning(f"[Expert Error] goal={goal_dest_idx}, err={e}")
+        except Exception:
             feasible = False
-            failure_reason = "invalid_action"
+            failure_reason = "expert_error"
 
-        # ===============================
-        # 2) Expert 失败 → BackupPolicy
-        # ===============================
+        # Backup
         if not feasible:
             backup_used = True
             self.stats_backup_activated += 1
 
-            # 将 numpy 数组资源转成 dict（BackupPolicy 需要）
-            backup_net_state = network_state.copy()
-            backup_net_state['cpu'] = {i: float(self.C[i]) for i in range(len(self.C))}
-            backup_net_state['mem'] = {i: float(self.M[i]) for i in range(len(self.M))}
+            bk_state = network_state.copy()
+            bk_state["cpu"] = {i: float(c) for i, c in enumerate(self.C)}
+            bk_state["mem"] = {i: float(m) for i, m in enumerate(self.M)}
 
             self.backup_policy.set_current_tree(list(self.nodes_on_tree))
-            plan = self.backup_policy.get_backup_plan(goal_dest_idx, backup_net_state)
+            plan = self.backup_policy.get_backup_plan(goal_dest_idx, bk_state)
 
-            if plan and plan.get('feasible'):
+            if plan and plan.get("feasible"):
                 feasible = True
                 self.stats_backup_succeeded += 1
-                backup_level = plan.get("backup_type", "unknown")
             else:
-                failure_reason = failure_reason or "resource_exhausted"
+                failure_reason = "resource_exhausted"
 
-        # ===============================
-        # 3) 部署或失败处理
-        # ===============================
-        if feasible and plan is not None:
-            # ---- 部署成功 ----
+        # --------------------------------------------------
+        # 4. 执行部署
+        # --------------------------------------------------
+        sub_task_done = False
+        cost_val = 1.0
+
+        if feasible and plan:
             self._apply_deployment(self.current_request, plan)
-
-            # [统计] 子任务成功数 +1
             self.stats_sub_success += 1
 
             if goal_dest_idx in self.unadded_dest_indices:
                 self.unadded_dest_indices.remove(goal_dest_idx)
 
-            # 记录路径
-            dest_list = self.current_request.get('dest', [])
-            dest_node = dest_list[goal_dest_idx] if goal_dest_idx < len(dest_list) else None
-
-            new_path = plan.get('new_path_full', [])
+            new_path = plan.get("new_path_full", [])
             if new_path:
                 self.path_manager.add_path(new_path)
-                if dest_node is not None:
-                    self.current_tree['paths_map'][dest_node] = new_path
+
+                dests = self.current_request.get("dest", [])
+                if goal_dest_idx < len(dests):
+                    dest_node = dests[goal_dest_idx]
+                    self.current_tree["paths_map"][dest_node] = new_path
+
                 self.nodes_on_tree.update(new_path)
 
             sub_task_done = True
 
-            # 计算基础 Cost
             path_len = len(new_path) if new_path else 1.0
             cost_val = 0.1 * (path_len / 10.0)
 
-            # 若所有目的节点都完成
-            if not self.unadded_dest_indices:
-                if (self.current_request, self.current_tree) not in self.served_requests:
-                    self.served_requests.append((self.current_request, self.current_tree))
-                self.total_requests_accepted += 1
-
         else:
-            # ---- 完全失败 ----
-            sub_task_done = False
-            cost_val = 5.0
-            failure_reason = failure_reason or "routing_deadlock"
-
-            # [统计] 标记该请求不再是“完美”的
+            # 子任务失败 ≠ 请求失败
             self.current_req_is_perfect = False
+            if self.enable_render:
+                self.render_failure(goal_dest_idx)
 
-            logger.debug(f"[Plan Failed] goal={goal_dest_idx}")
-
-            # -----------------------------
-            # [可视化] 仅在部分失败时保存图像
-            # -----------------------------
-            # 如果树中已经有路径(has_existing_paths=True)，但当前这一步失败了，说明是Partial Failure
-            has_existing_paths = len(self.current_tree.get('paths_map', {})) > 0
-            if self.enable_render and has_existing_paths:
-                self.render_failure(
-                    failed_dest_idx=goal_dest_idx,
-                    title=f"Partial Failure: Req {self.current_request['id']} (Tree Exists)"
-                )
-
-        # ===============================
-        # 4) QoS检查 + progress shaping
-        # ===============================
-        qos_viol = self._compute_qos_violation()
-        progress = self._compute_progress(goal_dest_idx)
-
-        # 整个请求是否终止
-        request_done = not self.unadded_dest_indices
-
-        # ===========================================================
-        # [修改] 5. 准备详细的 Logger 数据 (适配最终版 Logger)
-        # ===========================================================
-
-        # 1. 准备基础数据
-        dests = self.current_request.get('dest', [])
-        dest_node_id = dests[goal_dest_idx] if goal_dest_idx < len(dests) else -1
-
-        # 2. 构建详细的资源使用字典 (用于 Logger 去重计算)
-        vnf_placement_info = {}
-        link_usage_info = {}
-
-        step_cpu_cons = 0.0
-        step_mem_cons = 0.0
-        step_bw_cons = 0.0
-
-        if feasible and plan:
-            # --- 提取 VNF 放置信息 ---
-            # plan['placement'] 通常是 {vnf_index: node_id}
-            # 我们需要转成: {node_id: {'cpu': val, 'mem': val}}
-            req_cpus = self.current_request.get('cpu_origin', [])
-            req_mems = self.current_request.get('memory_origin', [])
-
-            # 如果有 placement 信息
-            if 'placement' in plan:
-                for v_idx, node in plan['placement'].items():
-                    # 获取该 VNF 的具体资源需求
-                    c_val = req_cpus[v_idx] if v_idx < len(req_cpus) else 0.0
-                    m_val = req_mems[v_idx] if v_idx < len(req_mems) else 0.0
-
-                    # 记录到字典 (如果同一个节点放了多个VNF，累加)
-                    if node not in vnf_placement_info:
-                        vnf_placement_info[node] = {'cpu': 0.0, 'mem': 0.0}
-                    vnf_placement_info[node]['cpu'] += float(c_val)
-                    vnf_placement_info[node]['mem'] += float(m_val)
-
-                    # 累计总消耗
-                    step_cpu_cons += c_val
-                    step_mem_cons += m_val
-
-            # --- 提取链路使用信息 ---
-            path_nodes = plan.get('new_path_full', [])
-            req_bw = float(self.current_request.get('bw_origin', 0.0))
-
-            if len(path_nodes) > 1:
-                for u, v in zip(path_nodes[:-1], path_nodes[1:]):
-                    # 确保链路 key 顺序一致，例如总是小号在前 (u, v)
-                    link_key = tuple(sorted((u, v)))
-                    link_usage_info[link_key] = {'bw': float(req_bw)}
-
-                # 累计总消耗 (跳数 * 带宽)
-                step_bw_cons = req_bw * (len(path_nodes) - 1)
-
-        # 3. 组装 step_info
-        step_info = {
-            "destination": int(dest_node_id),
-            "success": bool(feasible),
-            "path": plan.get('new_path_full', []) if feasible and plan else [],
-            "vnf_placement": vnf_placement_info,  # <--- [新增] 传入放置详情
-            "link_usage": link_usage_info,  # <--- [新增] 传入链路详情
-            "backup_used": bool(backup_used),
-            "backup_level": str(backup_level),
-            "failure_reason": str(failure_reason) if not feasible else None
-        }
-
-        # 4. 组装消耗概览 (兼容旧接口)
-        resource_consumed = {
-            "cpu": float(step_cpu_cons),
-            "bw": float(step_bw_cons),
-            "mem": float(step_mem_cons)
-        }
-
-        # 5. 获取网络状态
-        current_net_state = {
-            "available_cpu": float(np.sum(self.C)),
-            "available_bw": float(np.sum(self.B)),
-            "available_mem": float(np.sum(self.M)),
-            # 传入容量以便计算百分比
-            "node_cpu_capacity": float(self.C_cap) if not isinstance(self.C_cap, (list, np.ndarray)) else float(
-                np.mean(self.C_cap)),
-            "node_mem_capacity": float(self.M_cap) if not isinstance(self.M_cap, (list, np.ndarray)) else float(
-                np.mean(self.M_cap)),
-            "link_bw_capacity": float(self.B_cap) if not isinstance(self.B_cap, (list, np.ndarray)) else float(
-                np.mean(self.B_cap))
-        }
-
-        # D. 写入 Logger
-        if hasattr(self, 'metrics_logger'):
-            self.metrics_logger.record_step(step_info, resource_consumed, current_net_state)
-        # ===============================
-        # 6) 调用 RewardCritic (核心)
-        # ===============================
-        reward = self.reward_critic.criticize(
-            sub_task_completed=sub_task_done,
-            cost=cost_val,
-            request_failed=(request_done and not sub_task_done),
-            progress_to_goal=progress,
-            backup_used=backup_used,
-            backup_level=backup_level,
-            qos_violations=qos_viol,
-            failure_reason=failure_reason,
-            agent_action=int(low_level_action) if not isinstance(low_level_action, tuple) else -1,
-            expert_action=self.expert_low_level_action(goal_dest_idx),
-            state_novelty=self._state_novelty(),
-            expert_confidence=1.0
+        # --------------------------------------------------
+        # 5. 是否结束请求
+        # --------------------------------------------------
+        request_done = (
+                len(self.unadded_dest_indices) == 0
+                or self._req_step_count >= self._req_max_steps
         )
 
-        # ===============================
-        # [Logger] 7) 请求结束时的处理
-        # ===============================
+        # --------------------------------------------------
+        # 6. Critic 累积过程奖励（不结账）
+        # --------------------------------------------------
+        progress = self._compute_progress(goal_dest_idx)
+
+        self.reward_critic.criticize(
+            sub_task_completed=sub_task_done,
+            cost=cost_val,
+            request_failed=False,  # ❗请求失败只在结账阶段判断
+            progress_to_goal=progress,
+            backup_used=backup_used,
+            failure_reason=failure_reason,
+            agent_action=int(low_level_action) if not isinstance(low_level_action, tuple) else -1
+        )
+
+        # --------------------------------------------------
+        # 7. 结账（仅在 request 结束时）
+        # --------------------------------------------------
+        final_reward = 0.0
+
         if request_done:
-            # 更新统计计数器
-            self.stats_req_total += 1
-            if self.current_req_is_perfect:
-                self.stats_req_perfect += 1
+            is_full_success = (
+                    len(self.unadded_dest_indices) == 0
+                    and self.current_req_is_perfect
+            )
 
-            # 通知 Logger 结束部署记录
-            if hasattr(self, 'metrics_logger'):
-                self.metrics_logger.end_deployment(current_net_state)
+            if is_full_success:
+                self.total_requests_accepted += 1
+                if (self.current_request, self.current_tree) not in self.served_requests:
+                    self.served_requests.append((self.current_request, self.current_tree))
 
-                # (可选) 实时监控打印：每10个请求打印一次最近的成功率
-                if self.stats_req_total % 10 == 0:
-                    realtime_stats = self.metrics_logger.get_realtime_stats()
-                    acc = realtime_stats.get('recent_full_acceptance', 0)
-                    logger.info(f"[Metrics] Recent Full Acceptance: {acc:.2%}")
+            final_reward = self.reward_critic.on_request_done(
+                full_accept=is_full_success
+            )
 
-        return self._get_flat_state(), float(reward), sub_task_done, request_done
-
-
-    def _apply_deployment(self, request: Dict, plan: Dict):
-        """应用部署方案到网络状态（带防御性检查）"""
-        tree_branch = plan.get('tree', np.zeros(self.L))
-        hvt_branch = plan.get('hvt', np.zeros((self.n, self.K_vnf)))
-        self.current_tree['tree'] = np.logical_or(self.current_tree['tree'], tree_branch).astype(float)
-
-        bw_req = float(request.get('bw_origin', 0.0))
-
-        # 链路资源扣除：当引用计数为0时才真正扣带宽，然后无论如何引用计数+1
-        for link_idx in np.where(tree_branch > 0)[0]:
-            if self.link_ref_count[link_idx] == 0:
-                # 防御性：不要把带宽扣到负值
-                new_bw = self.B[link_idx] - bw_req
-                self.B[link_idx] = max(0.0, new_bw)
-            self.link_ref_count[link_idx] += 1
-
-        # 节点资源扣除（保持原有语义）
-        for node, vnf_t in np.argwhere(hvt_branch > 0):
-            if self.hvt_all[node, vnf_t] == 0:
-                try:
-                    j = request['vnf'].index(int(vnf_t + 1))
-                    self.C[node] = max(0.0, self.C[node] - request['cpu_origin'][j])
-                    self.M[node] = max(0.0, self.M[node] - request['memory_origin'][j])
-                except Exception:
-                    pass
-            self.hvt_all[node, vnf_t] += 1
-
-        self.current_tree['hvt'] = np.maximum(self.current_tree['hvt'], hvt_branch)
-
+        # --------------------------------------------------
+        # 8. 返回
+        # --------------------------------------------------
+        return (
+            self._get_flat_state(),
+            float(final_reward),
+            sub_task_done,
+            request_done
+        )
     def _shortest_distance(self, src: int, dst: int) -> float:
         """获取两节点间的最短距离"""
         if src == dst:
@@ -950,7 +1044,6 @@ class SFC_HIRL_Env(gym.Env):
                 return float(self.shortest_dist[src_idx, dst_idx])
 
         return 9999.0
-
     def _find_closest_tree_node_to_goal(self, goal_node: int) -> int:
         """找到树中离目标最近的节点"""
         if not self.nodes_on_tree:
@@ -966,110 +1059,6 @@ class SFC_HIRL_Env(gym.Env):
                 closest_node = node
 
         return closest_node
-    def _compute_progress(self, goal_idx):
-        """
-        修复版 progress 计算
-
-        计算当前状态距离目标的改善程度，范围 [-1,1]
-        - 负数 = 离目标更远
-        - 正数 = 更接近目标
-
-        使用最短路径矩阵而不是 networkx（避免依赖问题）
-        """
-        try:
-            if not self.current_request:
-                return 0.0
-
-            dest_list = self.current_request.get('dest', [])
-            if goal_idx >= len(dest_list):
-                return 0.0
-
-            goal_node = dest_list[goal_idx]
-
-            # 获取当前位置（树中最近添加的节点）
-            if self.nodes_on_tree:
-                # 找到树中离目标最近的节点
-                current_node = self._find_closest_tree_node_to_goal(goal_node)
-            else:
-                current_node = self.current_request.get('source', 1)
-
-            # 使用预计算的最短路径矩阵
-            current_dist = self._shortest_distance(current_node, goal_node)
-
-            # 获取上一步的距离
-            prev_dist = getattr(self, "_prev_dist", current_dist)
-            self._prev_dist = current_dist
-
-            # 如果第一次调用，返回0
-            if prev_dist == current_dist and not hasattr(self, "_progress_initialized"):
-                self._progress_initialized = True
-                return 0.0
-
-            # 计算进度
-            if prev_dist == 0:
-                return 1.0 if current_dist == 0 else -1.0
-
-            progress = (prev_dist - current_dist) / max(1, prev_dist)
-            return float(np.clip(progress, -1.0, 1.0))
-
-        except Exception as e:
-            logger.debug(f"[_compute_progress] Error: {e}")
-            return 0
-
-    def _compute_qos_violation(self):
-        """
-        简易 QoS 违反检测：
-        返回形如 {"delay":0.2, "bandwidth":0.1}
-        所有值 ∈ [0,1]，表示违反比例
-        """
-        viol = {}
-
-        # ---- 延迟违反 ----
-        if hasattr(self, "current_delay") and hasattr(self, "delay_threshold"):
-            if self.current_delay > self.delay_threshold:
-                viol["delay"] = min(1.0, (self.current_delay - self.delay_threshold) / self.delay_threshold)
-
-        # ---- 带宽违反 ----
-        if hasattr(self, "current_bw_usage") and hasattr(self, "bw_threshold"):
-            if self.current_bw_usage > self.bw_threshold:
-                viol["bandwidth"] = min(1.0, (self.current_bw_usage - self.bw_threshold) / self.bw_threshold)
-
-        # ---- 丢包率违反 ----
-        if hasattr(self, "current_loss") and hasattr(self, "loss_threshold"):
-            if self.current_loss > self.loss_threshold:
-                viol["packet_loss"] = min(1.0, (self.current_loss - self.loss_threshold) / self.loss_threshold)
-
-        return viol if viol else None
-
-    def _compute_progress(self, goal_dest_idx):
-        """
-        progress ∈ [-1,1]
-        负数 = 离目标更远
-        正数 = 更接近目标
-        """
-        try:
-            dest_node = self.current_request["dest"][goal_dest_idx]
-            current_node = self.current_state_info.get("current_node", None)
-
-            if current_node is None or dest_node is None:
-                return 0.0
-
-            # 使用最短路径距离衡量进度
-            import networkx as nx
-            d_prev = nx.shortest_path_length(self.G, self.prev_node, dest_node) if hasattr(self, "prev_node") else None
-            d_now = nx.shortest_path_length(self.G, current_node, dest_node)
-
-            self.prev_node = current_node
-
-            if d_prev is None:
-                return 0.0
-
-            progress = (d_prev - d_now) / max(1, d_prev)
-            return float(np.clip(progress, -1.0, 1.0))
-
-        except:
-            return 0.0
-
     def expert_low_level_action(self, goal_dest_idx):
         """
         返回专家推荐的低层动作
@@ -1079,7 +1068,6 @@ class SFC_HIRL_Env(gym.Env):
             return self.expert_last_action  # 如果你在 expert 调用后保存
         except:
             return -1
-
     def _state_novelty(self):
         """
         用于判断当前状态是否“新颖”
@@ -1097,7 +1085,6 @@ class SFC_HIRL_Env(gym.Env):
         # visit 越少 → 新颖度越高
         novelty = 1.0 / np.sqrt(self.state_visit_counter[s])
         return float(np.clip(novelty, 0.0, 1.0))
-
     # [新增] 辅助方法：准备数据并调用画图
     def render_failure(self, failed_dest_idx, failed_path=None, title="Failure"):
         if not self.enable_render or not self.current_request:

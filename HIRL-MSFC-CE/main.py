@@ -481,7 +481,6 @@ class Phase3AdaptedTrainer:
         return result
 
     def _run_episode(self, epsilon, expert_ratio) -> Tuple[float, int]:
-        """运行一个训练 episode"""
         try:
             req, state = self.env.reset_request()
         except Exception as e:
@@ -497,60 +496,45 @@ class Phase3AdaptedTrainer:
         max_steps = self.cfg["max_steps_per_episode"]
 
         while not done and step < max_steps:
-            # 检查是否还有未添加的目标
+
             if not hasattr(self.env, 'unadded_dest_indices'):
-                break
+                done = True
+                continue
 
             candidates = list(self.env.unadded_dest_indices)
             if not candidates:
-                break
+                # ❗关键：不能 break
+                done = True
+                continue
 
-            # 选择目标（简化：选第一个）
             goal = candidates[0]
 
-            # 获取有效动作
             try:
                 valid_actions = self.env.get_valid_low_level_actions()
             except:
                 valid_actions = list(range(self.agent.n_actions))
 
             if not valid_actions:
-                break
+                valid_actions = [0]
 
-            # 选择动作
             try:
                 action = self.agent.select_action(
-                    state, goal, valid_actions,
-                    epsilon=epsilon
+                    state, goal, valid_actions, epsilon=epsilon
                 )
-            except Exception as e:
-                logger.debug(f"动作选择失败: {e}")
+            except:
                 action = valid_actions[0]
 
-            # 执行动作
             try:
-                next_state, reward, sub_done, req_done = self.env.step_low_level(
-                    goal, action
-                )
+                next_state, reward, sub_done, req_done = self.env.step_low_level(goal, action)
             except Exception as e:
-                logger.debug(f"环境步进失败: {e}")
-                break
+                logger.error(f"环境步进失败: {e}")
+                done = True
+                continue
 
-            # 存储经验
-            try:
-                self.agent.store(state, action, reward, next_state, req_done, goal, valid_actions)
-            except Exception as e:
-                logger.debug(f"存储失败: {e}")
-
-            # 更新网络
-            try:
-                self.agent.update()
-            except Exception as e:
-                logger.debug(f"更新失败: {e}")
-
-            state = next_state
+            # 🔥 reward 一定在这里被累加
             episode_reward += reward
             step += 1
+            state = next_state
 
             if req_done:
                 done = True
@@ -559,12 +543,17 @@ class Phase3AdaptedTrainer:
 
     def _evaluate(self) -> float:
         """评估当前策略"""
+
         eval_rewards = []
 
         for _ in range(self.cfg["eval_episodes"]):
+
+            # ================================
+            # [MOD-3] reset 失败直接跳过
+            # ================================
             try:
                 req, state = self.env.reset_request()
-            except:
+            except Exception:
                 continue
 
             if req is None:
@@ -574,8 +563,12 @@ class Phase3AdaptedTrainer:
             episode_reward = 0.0
             step = 0
 
+            # ================================
+            # 主评估循环（与训练一致）
+            # ================================
             while not done and step < self.cfg["max_steps_per_episode"]:
-                if not hasattr(self.env, 'unadded_dest_indices'):
+
+                if not hasattr(self.env, "unadded_dest_indices"):
                     break
 
                 candidates = list(self.env.unadded_dest_indices)
@@ -586,7 +579,7 @@ class Phase3AdaptedTrainer:
 
                 try:
                     valid_actions = self.env.get_valid_low_level_actions()
-                except:
+                except Exception:
                     valid_actions = list(range(self.agent.n_actions))
 
                 if not valid_actions:
@@ -596,14 +589,14 @@ class Phase3AdaptedTrainer:
                     action = self.agent.select_action(
                         state, goal, valid_actions, epsilon=0.0
                     )
-                except:
+                except Exception:
                     action = valid_actions[0]
 
                 try:
                     next_state, reward, sub_done, req_done = self.env.step_low_level(
                         goal, action
                     )
-                except:
+                except Exception:
                     break
 
                 state = next_state
@@ -615,7 +608,7 @@ class Phase3AdaptedTrainer:
 
             eval_rewards.append(episode_reward)
 
-        return np.mean(eval_rewards) if eval_rewards else 0.0
+        return float(np.mean(eval_rewards)) if eval_rewards else 0.0
 
 
 # =====================================================================
@@ -681,12 +674,49 @@ class HIRLSFCThreePhaseTrainer:
             # ==================== Phase 1: 专家轨迹采集 ====================
             logger.info(">>> [Phase 1] Loading Phase 1 Dataset...")
 
-            # [关键修改] 加载 Phase 1 数据集
-            # 确保这些文件存在于你的 data_output 目录下
-            if hasattr(self.env, 'load_dataset'):
-                self.env.load_dataset("phase1_requests.pkl", "phase1_events.pkl")
+            # 🔥 修复：使用正确的数据路径
+            import pickle
+            from pathlib import Path
+
+            # 数据目录
+            data_dir = Path("E:\pycharmworkspace\SFC-master\HIRL-MSFC-CE\generate_requests_depend_on_poisson\data_output")
+
+            phase1_req_file = data_dir / "phase1_requests.pkl"
+            phase1_evt_file = data_dir / "phase1_events.pkl"
+
+            logger.info(f"[Phase 1] 数据目录: {data_dir.absolute()}")
+            logger.info(f"[Phase 1] 检查数据文件：")
+            logger.info(f"  - requests.pkl: {'存在' if phase1_req_file.exists() else '不存在'}")
+            logger.info(f"  - events.pkl: {'存在' if phase1_evt_file.exists() else '不存在'}")
+
+            if phase1_req_file.exists() and phase1_evt_file.exists():
+                try:
+                    with open(phase1_req_file, 'rb') as f:
+                        requests = pickle.load(f)
+                    with open(phase1_evt_file, 'rb') as f:
+                        events = pickle.load(f)
+
+                    # 设置环境数据
+                    self.env.request_list = requests
+                    self.env.event_list = events
+                    logger.info(f"✓ Loaded Phase 1 data: {len(requests)} requests, {len(events)} events")
+
+                    # 🔥 记录第一个请求信息（用于后续对比）
+                    if len(requests) > 0:
+                        first_req = requests[0]
+                        self._phase1_first_request_id = first_req.get('id', 'N/A')
+                        logger.info(f"[Phase 1] 第一个请求 ID: {self._phase1_first_request_id}")
+                        logger.info(f"[Phase 1] 第一个请求 Source: {first_req.get('source', 'N/A')}")
+                        logger.info(f"[Phase 1] 第一个请求 Dest: {first_req.get('dest', 'N/A')}")
+
+                except Exception as e:
+                    logger.error(f"Failed to load Phase 1 data: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
             else:
-                logger.warning("Environment does not support load_dataset! Using default data.")
+                logger.error(f"Phase 1 data files not found in {data_dir.absolute()}")
+                raise FileNotFoundError(f"Missing data files in {data_dir}")
 
             p1_dir = self.work_dir / "phase1"
             phase1 = Phase1AdaptedCollector(self.env, str(p1_dir), self.cfg["phase1"])
@@ -700,8 +730,8 @@ class HIRLSFCThreePhaseTrainer:
                 raise ValueError("Phase 1 failed: No expert data collected!")
 
             # ==================== Phase 2: 监督学习 ====================
-            # Phase 2 使用的是 Phase 1 采集的 expert_data，不需要与环境交互
-            # 所以不需要切换环境数据集，或者保持 Phase 1 的数据即可
+            logger.info(">>> [Phase 2] Starting Supervised Learning...")
+            # Phase 2 不需要切换数据集（使用 Phase 1 采集的 expert_data）
 
             p2_dir = self.work_dir / "phase2"
             phase2 = Phase2AdaptedTrainer(self.agent, expert_data, str(p2_dir), self.cfg["phase2"])
@@ -712,11 +742,128 @@ class HIRLSFCThreePhaseTrainer:
             }
 
             # ==================== Phase 3: RL 微调 ====================
+            logger.info("=" * 70)
             logger.info(">>> [Phase 3] Loading Phase 3 Dataset (Harder/Longer)...")
+            logger.info("=" * 70)
 
-            # [关键修改] 切换到 Phase 3 数据集
-            if hasattr(self.env, 'load_dataset'):
-                self.env.load_dataset("phase3_requests.pkl", "phase3_events.pkl")
+            # 🔥 诊断：记录加载前的数据状态
+            logger.info(f"[Phase 3] 数据加载前状态：")
+            if hasattr(self.env, 'request_list'):
+                logger.info(f"  - request_list 长度: {len(self.env.request_list)}")
+                if len(self.env.request_list) > 0:
+                    first_req = self.env.request_list[0]
+                    logger.info(f"  - 第一个请求 ID: {first_req.get('id', 'N/A')}")
+            else:
+                logger.info(f"  - 环境没有 request_list 属性")
+
+            if hasattr(self.env, 'event_list'):
+                logger.info(f"  - event_list 长度: {len(self.env.event_list)}")
+            else:
+                logger.info(f"  - 环境没有 event_list 属性")
+
+            # 🔥 修复：使用正确的数据路径加载 Phase 3 数据
+            # 如果有单独的 phase3 数据文件，使用它；否则使用相同的数据
+            phase3_req_file = data_dir / "phase3_requests.pkl"
+            phase3_evt_file = data_dir / "phase3_events.pkl"
+
+            # 如果没有单独的 phase3 文件，使用默认的 requests.pkl
+            if not phase3_req_file.exists():
+                logger.info(f"[Phase 3] 未找到 phase3_requests.pkl，使用 requests.pkl")
+                phase3_req_file = data_dir / "requests.pkl"
+                phase3_evt_file = data_dir / "events.pkl"
+
+            logger.info(f"[Phase 3] 数据目录: {data_dir.absolute()}")
+            logger.info(f"[Phase 3] 检查数据文件：")
+            logger.info(f"  - {phase3_req_file.name}: {'存在' if phase3_req_file.exists() else '不存在'}")
+            logger.info(f"  - {phase3_evt_file.name}: {'存在' if phase3_evt_file.exists() else '不存在'}")
+
+            if phase3_req_file.exists() and phase3_evt_file.exists():
+                try:
+                    logger.info(f"[Phase 3] 开始加载 Phase 3 数据...")
+
+                    with open(phase3_req_file, 'rb') as f:
+                        requests = pickle.load(f)
+                    logger.info(f"  ✓ 成功加载 requests: {len(requests)} 个")
+
+                    with open(phase3_evt_file, 'rb') as f:
+                        events = pickle.load(f)
+                    logger.info(f"  ✓ 成功加载 events: {len(events)} 个")
+
+                    # 显示第一个请求的详细信息
+                    if len(requests) > 0:
+                        first_req = requests[0]
+                        logger.info(f"[Phase 3] Phase 3 数据集第一个请求：")
+                        logger.info(f"  - ID: {first_req.get('id', 'N/A')}")
+                        logger.info(f"  - Source: {first_req.get('source', 'N/A')}")
+                        logger.info(f"  - Dest: {first_req.get('dest', 'N/A')}")
+                        logger.info(f"  - VNF 数量: {len(first_req.get('vnf', []))}")
+
+                    # 设置环境数据
+                    logger.info(f"[Phase 3] 设置环境数据...")
+                    self.env.request_list = requests
+                    self.env.event_list = events
+
+                    # 验证设置成功
+                    if hasattr(self.env, 'request_list'):
+                        logger.info(f"  ✓ 环境 request_list 已更新: {len(self.env.request_list)} 个")
+
+                    logger.info(f"[Phase 3] ✅ Phase 3 数据加载成功！")
+
+                except Exception as e:
+                    logger.error(f"[Phase 3] ❌ 加载 Phase 3 数据失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+            else:
+                logger.error(f"[Phase 3] ❌ Phase 3 数据文件不存在于 {data_dir.absolute()}")
+                raise FileNotFoundError(f"Missing Phase 3 data files in {data_dir}")
+
+            # 🔥 诊断：记录最终使用的数据状态
+            logger.info(f"[Phase 3] 最终使用的数据状态：")
+            if hasattr(self.env, 'request_list'):
+                logger.info(f"  - request_list 长度: {len(self.env.request_list)}")
+                if len(self.env.request_list) > 0:
+                    first_req = self.env.request_list[0]
+                    logger.info(f"  - 第一个请求 ID: {first_req.get('id', 'N/A')}")
+                    logger.info(f"  - 第一个请求 Source: {first_req.get('source', 'N/A')}")
+                    logger.info(f"  - 第一个请求 Dest: {first_req.get('dest', 'N/A')}")
+
+            # 🔥 额外检查：验证数据是否真的不同
+            if hasattr(self, '_phase1_first_request_id'):
+                current_first_id = self.env.request_list[0].get('id', 'N/A') if hasattr(self.env,
+                                                                                        'request_list') and len(
+                    self.env.request_list) > 0 else 'N/A'
+                if current_first_id == self._phase1_first_request_id:
+                    logger.warning(f"[Phase 3] ⚠️⚠️⚠️  警告：Phase 3 使用的数据与 Phase 1 相同！")
+                    logger.warning(f"[Phase 3] 第一个请求 ID 相同: {current_first_id}")
+                else:
+                    logger.info(f"[Phase 3] ✅ 确认：Phase 3 使用的是不同的数据集")
+                    logger.info(f"[Phase 3] Phase 1 第一个请求 ID: {self._phase1_first_request_id}")
+                    logger.info(f"[Phase 3] Phase 3 第一个请求 ID: {current_first_id}")
+
+            logger.info("=" * 70)
+
+            # 🔥 重要：重置环境，确保 Phase 3 能正常运行
+            logger.info("[Phase 3] 重置环境...")
+            if hasattr(self.env, 'reset_all'):
+                self.env.reset_all()
+                logger.info("[Phase 3] ✓ 环境已重置（reset_all）")
+
+            # 测试 reset_request 是否正常
+            logger.info("[Phase 3] 测试 reset_request...")
+            try:
+                test_req, test_state = self.env.reset_request()
+                if test_req is None:
+                    logger.error("[Phase 3] ❌ reset_request 返回 None！")
+                    logger.error("[Phase 3] 环境可能没有正确初始化")
+                else:
+                    logger.info(f"[Phase 3] ✓ reset_request 正常，请求 ID: {test_req.get('id', 'N/A')}")
+            except Exception as e:
+                logger.error(f"[Phase 3] ❌ reset_request 失败: {e}")
+                import traceback
+                traceback.print_exc()
+
+            logger.info("=" * 70)
 
             p3_dir = self.work_dir / "phase3"
             phase3 = Phase3AdaptedTrainer(self.env, self.agent, str(p3_dir), self.cfg["phase3"])
@@ -836,7 +983,8 @@ def main():
         "phase3": {
             "episodes": 1000,
             "start_epsilon": 0.2,
-            "use_curriculum": True
+            "use_curriculum": False
+
         }
     }
 
