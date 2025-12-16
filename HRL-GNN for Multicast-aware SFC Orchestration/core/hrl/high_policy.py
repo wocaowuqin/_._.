@@ -1,7 +1,7 @@
 #高层选择节点
 import torch
 import torch.nn as nn
-from core.gnn.multicast_gat import MulticastAwareGAT
+from core.gnn import MulticastAwareGAT
 from core.hrl.mid_policy import MidLevelPolicy
 from core.hrl.low_policy import LowLevelPolicy
 
