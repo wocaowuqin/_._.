@@ -1,22 +1,41 @@
+# envs/modules/policy_helper.py
 import numpy as np
-import random
 import logging
-from typing import List, Tuple, Dict, Optional, Any, Set
+import sys
+import copy
+from pathlib import Path
+from typing import Dict, Any, Optional, List, Tuple
+
 from .sfc_backup_system.backup_policy import BackupPolicy
-# 尝试导入专家模块，如果不存在则定义占位符
+
+# ==========================================================
+# Expert Import
+# ==========================================================
 try:
-    from expert_msfce import MSFCE_Solver
+    from core.expert.expert_msfce import MSFCE_Solver
 except ImportError:
-    # 占位符，防止IDE报错或在无Expert环境下运行
-    class MSFCE_Solver:
-        def __init__(self, *args, **kwargs): pass
+    try:
+        from expert_msfce import MSFCE_Solver
+    except ImportError:
+        # 动态添加路径适配
+        current_file = Path(__file__).resolve()
+        project_root = current_file.parents[3]
+        sys.path.append(str(project_root))
+        try:
+            from core.expert.expert_msfce import MSFCE_Solver
+        except ImportError:
+            # 占位符防止 IDE 报错
+            class MSFCE_Solver:
+                def __init__(self, *args, **kwargs):
+                    self.node_num = 28;
+                    self.link_num = 100;
+                    self.type_num = 8;
+                    self.k_path = 5
 
-        @property
-        def k_path_count(self): return 5
+                @property
+                def k_path_count(self): return 5
 
-        def _calc_eval(self, *args): return -np.inf, [], [], [], False, 0, 0, {}
-
-        def _calc_atnp(self, *args): return {}, -np.inf, [], {}
+                def solve_request_for_expert(self, *args): return None, []
 
 logger = logging.getLogger(__name__)
 
@@ -24,332 +43,233 @@ logger = logging.getLogger(__name__)
 class PolicyHelper:
     """
     策略辅助模块：
-    1. 封装专家系统 (Expert System) 的复杂计算
-    2. 封装备份策略 (Backup Policy) 的调用
-    3. 提供高层/低层动作的掩码 (Mask) 计算
+    - Phase1：只允许专家规划（禁止 backup / 执行）
+    - Phase2：专家引导 + backup
+    - Phase3：纯 RL + backup
     """
 
     def __init__(self, input_dir, topo, dc_nodes, capacities):
-        # 1. 初始化专家系统
-        # 注意：Expert 需要读取 .mat 文件，路径需拼接
+        if isinstance(input_dir, str):
+            input_dir = Path(input_dir)
+
         expert_db_path = input_dir / "US_Backbone_path.mat"
+        if not expert_db_path.exists():
+            expert_db_path = input_dir.parent / "input_dir" / "US_Backbone_path.mat"
+
+        # Expert
         self.expert = MSFCE_Solver(expert_db_path, topo, dc_nodes, capacities)
 
-        # 2. 初始化备份策略
+        # Backup Policy
         self.backup_policy = BackupPolicy(
-            self.expert,
-            self.expert.node_num,
-            self.expert.link_num,
-            self.expert.type_num,
-            dc_nodes
+            expert=self.expert,
+            n=getattr(self.expert, 'node_num', 28),
+            L=getattr(self.expert, 'link_num', 45),
+            K_vnf=getattr(self.expert, 'type_num', 8),
+            dc_nodes=dc_nodes,
         )
 
-        # 3. 常用参数缓存
-        self.K_path = self.expert.k_path_count
-        self.expert_randomness = 0.1  # 专家策略的随机扰动概率
-        self._eval_cache = {}  # 专家评估结果缓存
+        self.K_path = getattr(self.expert, "k_path_count", 5)
+        self._expert_cache: Dict[int, Optional[Dict[str, Any]]] = {}
 
     def clear_cache(self):
-        """每步开始前清空缓存"""
-        self._eval_cache.clear()
+        self._expert_cache.clear()
 
-    # =========================================================================
-    # 核心功能：获取部署方案 (Expert + Backup)
-    # =========================================================================
-    def get_best_plan(self, request: Dict, network_state: Dict,
-                      goal_dest_idx: int, k_idx: int, i_idx: int,
-                      current_tree: Dict, nodes_on_tree: Set[int],
-                      path_manager) -> Tuple[bool, Optional[Dict], bool, Optional[str]]:
+    # ==========================================================
+    # Phase 1 ONLY —— 专家全局规划
+    # ==========================================================
+    def get_expert_plan(self, request, network_state):
         """
-        尝试获取最佳部署方案：先问专家，不行再问备份。
-
-        Returns:
-            feasible (bool): 是否成功找到方案
-            plan (dict): 具体的部署方案 (tree, hvt, new_path_full, placement)
-            backup_used (bool): 是否使用了备份策略
-            failure_reason (str): 失败原因
+        Phase1 唯一允许的接口：获取专家完整规划
         """
-        feasible = False
-        plan = None
-        backup_used = False
-        failure_reason = None
+        expert_info = self._run_expert_if_needed(request, network_state)
+        if expert_info is None:
+            return None
+        return {
+            "tree": expert_info["tree"],
+            "trajectory": expert_info["trajectory"],
+        }
 
-        k = k_idx + 1  # Expert 使用 1-based index
+    def _run_expert_if_needed(self, request, network_state):
+        req_id = request['id']
+        if req_id in self._expert_cache:
+            return self._expert_cache[req_id]
 
-        # --- 1. 尝试专家策略 (Expert) ---
-        try:
-            # Case A: 树为空 (Source -> Dest)
-            if not current_tree['paths_map']:
-                eval_val, paths, tree, hvt, feasible, _, _, placement_expert = \
-                    self.expert._calc_eval(request, goal_dest_idx, k, network_state)
+        N = self.expert.node_num  # = 28
 
-                if feasible:
-                    plan = {
-                        'tree': tree,
-                        'hvt': hvt,
-                        'new_path_full': paths,
-                        'placement': placement_expert
-                    }
+        # ===== source =====
+        src0 = int(request['source'])
+        src1 = src0 + 1
+        if not (1 <= src1 <= N):
+            logger.error(f"[Expert] Invalid source after convert: {src1}")
+            self._expert_cache[req_id] = None
+            return None
 
-            # Case B: 树已存在 (Tree -> Dest)
+        # ===== dests =====
+        dests1 = []
+        for d0 in request['dest']:
+            d0 = int(d0)
+
+            # 🔥 关键：先判断它是不是已经 1-based
+            if 1 <= d0 <= N:
+                d1 = d0
             else:
-                # 从 PathManager 获取路径
-                conn_path = self._get_path_for_i_idx(path_manager, current_tree, request, i_idx)
+                d1 = d0 + 1
 
-                plan, _, _, _ = self.expert._calc_atnp(
-                    current_tree, conn_path, goal_dest_idx, network_state, nodes_on_tree
+            if not (1 <= d1 <= N):
+                logger.warning(
+                    f"[Expert] Drop invalid dest: raw={d0}, conv={d1}, valid=[1,{N}]"
                 )
-                feasible = plan.get('feasible', False) if plan else False
+                continue
 
+            dests1.append(d1)
+
+        if len(dests1) == 0:
+            logger.warning(f"[Expert] No valid dests for req {req_id}")
+            self._expert_cache[req_id] = None
+            return None
+
+        expert_req = {
+            **request,
+            "source": src1,
+            "dest": dests1
+        }
+
+        try:
+            tree_info, trajectory = self.expert.solve_request_for_expert(
+                expert_req, network_state
+            )
         except Exception as e:
-            feasible = False
-            failure_reason = "expert_error"
-            # logger.debug(f"Expert calculation failed: {e}")
+            logger.error(f"[Expert] Solver crashed: {e}")
+            self._expert_cache[req_id] = None
+            return None
 
-        # --- 2. 尝试备份策略 (Backup) ---
-        if not feasible:
-            backup_used = True
+        if tree_info is None:
+            self._expert_cache[req_id] = None
+            return None
 
-            # 构建备份所需的状态副本 (防止修改原数据)
-            bk_state = network_state.copy()
-            # BackupPolicy 需要 float 类型的 cpu/mem 字典
-            bk_state['cpu'] = {i: float(c) for i, c in enumerate(network_state['cpu'])}
-            bk_state['mem'] = {i: float(m) for i, m in enumerate(network_state['mem'])}
+        self._expert_cache[req_id] = {
+            "tree": tree_info,
+            "trajectory": trajectory
+        }
+        return self._expert_cache[req_id]
 
-            self.backup_policy.set_current_request(request)
-            self.backup_policy.set_current_tree(list(nodes_on_tree))
+    # ==========================================================
+    # Phase 2 / Phase 3 —— 执行接口
+    # ==========================================================
+    def get_best_plan(
+            self,
+            request,
+            network_state,
+            goal_dest_idx,
+            k_idx,
+            i_idx,
+            current_tree,
+            nodes_on_tree,
+            path_manager,
+            unadded_dest_indices=None,
+    ):
+        """
+        Phase2/3 使用：
+        先尝试专家缓存路径，失败再使用 backup 策略兜底
+        """
+        req_id = request["id"]
 
-            plan = self.backup_policy.get_backup_plan(goal_dest_idx, bk_state)
+        # 1. 尝试专家缓存
+        if req_id in self._expert_cache and self._expert_cache[req_id] is not None:
+            expert_info = self._expert_cache[req_id]
+            paths_map = expert_info["tree"].get("paths_map", {})
 
-            if plan and plan.get('feasible'):
-                feasible = True
+            # 确定正确的目标索引
+            if unadded_dest_indices is not None:
+                try:
+                    # goal_dest_idx 是 unadded_dest_indices 集合的相对下标
+                    # 我们需要取回 request['dest'] 的绝对下标
+                    real_idx = list(unadded_dest_indices)[goal_dest_idx]
+                except Exception:
+                    return False, None, False, "index_error"
             else:
-                failure_reason = "resource_exhausted"
-        # 3.记录专家动作（用于 DAgger）
-        if feasible and not backup_used:
-            # 记录专家选择的动作
-            action = i_idx * self.K_path + k_idx
-            self.last_expert_action = action
-        else:
-            # 如果失败或使用备份，标记为无效
-            self.last_expert_action = -1
-        return feasible, plan, backup_used, failure_reason
+                real_idx = goal_dest_idx
 
-    # =========================================================================
-    # 辅助功能：高层策略 (High Level)
-    # =========================================================================
+            # 获取目标节点 ID (Env 0-based)
+            target_node_0 = request["dest"][real_idx]
+            target_node_1 = target_node_0 + 1  # Expert Key (1-based)
+
+            # 查找路径
+            path = paths_map.get(target_node_1) or paths_map.get(target_node_0)
+
+            if path is not None:
+                # 转换路径节点回 0-based
+                # 启发式判断：如果路径包含 >27 的节点或包含 1-based 目标，则判定为 1-based
+                is_1based = any(n > 27 for n in path) or (target_node_1 in path)
+
+                if is_1based:
+                    path_0based = [n - 1 for n in path]
+                else:
+                    path_0based = list(path)
+
+                # 计算 VNF 放置
+                hvt_map = self.backup_policy.place_vnfs(request, path_0based)
+                if hvt_map is not None:
+                    plan = {
+                        "nodes": path_0based,
+                        "new_path_full": path_0based,
+                        "hvt": hvt_map,
+                        "tree": np.zeros(getattr(self.expert, 'link_num', 100)),
+                    }
+                    return True, plan, False, "expert_success"
+
+        # 2. 回退到 Backup Policy
+        return self.backup_policy.find_path_and_deploy(
+            request, network_state, goal_dest_idx, nodes_on_tree
+        )
+
+    # ==========================================================
+    # 兼容性接口 (Env 依赖)
+    # ==========================================================
     def get_expert_candidates(self, request, network_state, unadded_dests,
                               current_tree, nodes_on_tree, top_k=5):
-        """
-        计算所有未完成目标节点的专家评分，返回候选列表
-        """
-        if not request or not unadded_dests:
+        """env.get_expert_high_level_candidates 依赖此接口"""
+        expert_info = self._run_expert_if_needed(request, network_state)
+        if expert_info is None:
             return []
 
-        req_id = request['id']
-        candidates = []
+        trajectory = expert_info['trajectory']
+        target_idx = -1
 
-        # Stage 1: S -> d (树为空)
-        if not current_tree['paths_map']:
-            for d_idx in unadded_dests:
-                best_eval = -float('inf')
-                for k in range(1, self.K_path + 1):
-                    # 使用缓存避免重复计算
-                    cache_key = (req_id, d_idx, k)
-                    if cache_key in self._eval_cache:
-                        eval_val = self._eval_cache[cache_key]
-                    else:
-                        try:
-                            eval_val, _, _, _, feasible, _, _, _ = self.expert._calc_eval(
-                                request, d_idx, k, network_state
-                            )
-                            if not feasible or eval_val is None:
-                                eval_val = -float('inf')
-                        except:
-                            eval_val = -float('inf')
-                        self._eval_cache[cache_key] = eval_val
+        # 兼容 set 或 list
+        unadded_set = set(unadded_dests) if isinstance(unadded_dests, (list, tuple)) else unadded_dests
 
-                    if eval_val > best_eval:
-                        best_eval = eval_val
+        for item in trajectory:
+            d_idx = item[0]
+            if d_idx in unadded_set:
+                target_idx = d_idx
+                break
 
-                if best_eval > -float('inf'):
-                    candidates.append((d_idx, float(best_eval)))
+        if target_idx == -1:
+            return []
 
-        # Stage 2: Tree -> d (树已存在)
-        else:
-            for d_idx in unadded_dests:
-                best_eval = -float('inf')
-                # 遍历树上所有可能的连接路径
-                for conn_path in current_tree['paths_map'].values():
-                    try:
-                        _, eval_val, _, _ = self.expert._calc_atnp(
-                            current_tree, conn_path, d_idx, network_state, nodes_on_tree
-                        )
-                        if eval_val is not None:
-                            best_eval = max(best_eval, eval_val)
-                    except:
-                        pass
+        candidates = [(target_idx, 10.0)]
+        for d in unadded_dests:
+            if d != target_idx:
+                candidates.append((d, 0.0))
+        return candidates
 
-            if best_eval > -float('inf'):
-                candidates.append((d_idx, float(best_eval)))
+    def expert_low_level_action(self):
+        """env.expert_low_level_action 依赖此接口 (Phase1 返回无效动作)"""
+        return -1
 
-        # 排序
-        candidates.sort(key=lambda x: x[1], reverse=True)
+    # ==========================================================
+    # Masks / Decoding
+    # ==========================================================
+    def decode_low_level_action(self, action, max_paths=10):
+        return action // self.K_path, action % self.K_path
 
-        # 增加随机性 (DAgger 常用技巧)
-        if len(candidates) >= 2 and random.random() < self.expert_randomness:
-            candidates[0], candidates[1] = candidates[1], candidates[0]
-
-        return candidates[:top_k]
-
-    def get_expert_high_level_goal(self, request, network_state, unadded_dests,
-                                   current_tree, nodes_on_tree):
-        """获取专家推荐的单一高层目标"""
-        cands = self.get_expert_candidates(
-            request, network_state, unadded_dests, current_tree, nodes_on_tree, top_k=1
-        )
-        if cands:
-            return int(cands[0][0])
-        # Fallback: 如果专家算不出来，就选第一个未完成的
-        if unadded_dests:
-            return int(next(iter(unadded_dests)))
-        return 0
-
-    # =========================================================================
-    # 辅助功能：低层策略 (Low Level)
-    # =========================================================================
-    def get_valid_low_level_actions(self, path_manager, current_tree):
-        """获取当前状态下所有合法的低层动作索引"""
-        valid_actions = []
-
-        # 如果树为空，所有 K_path (0~4) 都是合法的 (从源点出发)
-        if not current_tree or not current_tree.get('paths_map'):
-            for k in range(self.expert.k_path_count):
-                valid_actions.append(k)
-        else:
-            # 否则，动作 = PathIdx * K_path + k
-            num_paths = max(1, len(path_manager))
-            # 限制 PathManager 中的路径数量，防止动作空间爆炸
-            # (假设最大动作数 NB_LOW_LEVEL_ACTIONS 足够覆盖)
-            for i in range(num_paths):
-                for k in range(self.expert.k_path_count):
-                    action_id = i * self.expert.k_path_count + k
-                    valid_actions.append(action_id)
-
-        return valid_actions if valid_actions else [0]
-    def _get_path_for_i_idx(self, path_manager, current_tree, request, i_idx: int) -> List[int]:
-        """根据索引从 PathManager 获取具体路径列表"""
-        if not current_tree or not current_tree['paths_map']:
-            return [request['source']] if request else [0]
-
-        path = path_manager.get_path(i_idx)
-        if path is None:
-            # 如果索引越界，做回退处理 (例如取第0条路径)
-            if len(path_manager) > 0:
-                return path_manager.get_path(0)
-            return [request['source']]
-        return path
-    # =========================================================================
-    # 辅助功能：掩码计算 (Masks)
-    # =========================================================================
-    def get_action_masks(self, num_high: int, num_low: int,
-                         high_cands: List[Tuple[int, float]],
-                         low_valid: List[int]) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        计算高层和低层的 Action Mask
-        Returns:
-            high_mask: [NB_HIGH_LEVEL_GOALS]
-            low_mask: [NB_LOW_LEVEL_ACTIONS]
-        """
-        # 1. High-level mask
-        high_mask = np.zeros(num_high, dtype=np.float32)
-        for d_idx, _ in high_cands:
-            if 0 <= d_idx < num_high:
-                high_mask[d_idx] = 1.0
-
-        # 2. Low-level mask
-        low_mask = np.zeros(num_low, dtype=np.float32)
-        for a in low_valid:
-            if 0 <= a < num_low:
-                low_mask[a] = 1.0
-
-        return high_mask, low_mask
-
-    # envs/modules/policy_helper.py
-    def get_expert_high_level_labels(self, request, network_state, unadded_dests,
-                                     current_tree, nodes_on_tree, top_k=5):
-        """
-        [遗漏补充] 获取专家的高层策略标签 (用于 Phase 2 模仿学习训练)
-        返回: (ids, scores, best_id)
-        """
-        cands = self.get_expert_candidates(
-            request, network_state, unadded_dests, current_tree, nodes_on_tree, top_k=top_k
-        )
-        if not cands:
-            return [], [], 0
-
-        ids = [int(c[0]) for c in cands]
-        scores = [float(c[1]) for c in cands]
-        return ids, scores, ids[0]
-
-    def decode_low_level_action(self, action: int, max_paths: int = 10) -> Tuple[int, int]:
-        """
-        解码低层动作为 (i_idx, k_idx)
-
-        公式: action = i_idx * K_path + k_idx
-
-        Args:
-            action: 动作编号
-            max_paths: 最大路径数（MAX_PATHS_IN_TREE）
-
-        Returns:
-            (i_idx, k_idx): 路径索引和 k-path 索引
-        """
-        k_idx = int(action % self.K_path)
-        i_idx = int(action // self.K_path)
-
-        # 限制在有效范围
-        i_idx = i_idx % max_paths
-
-        return i_idx, k_idx
-    def get_high_level_candidate_mask(self, candidates: List[Tuple[int, float]]) -> np.ndarray:
-        """生成高层候选动作掩码"""
-        mask = np.zeros(self.NB_HIGH_LEVEL_GOALS, dtype=np.float32)
-        for dest_idx, _ in candidates:
-            if 0 <= dest_idx < self.NB_HIGH_LEVEL_GOALS:
-                mask[dest_idx] = 1.0
+    def get_high_level_candidate_mask(self, candidates, num_goals):
+        mask = np.zeros(num_goals, dtype=np.float32)
+        for idx, _ in candidates:
+            if 0 <= idx < num_goals:
+                mask[idx] = 1.0
         return mask
 
-    def get_low_level_action_mask(self, path_manager, current_tree,
-                                  num_actions: int) -> np.ndarray:
-        """
-        生成低层动作掩码（用于 Agent）
-
-        Args:
-            path_manager: 路径管理器
-            current_tree: 当前树结构
-            num_actions: 总动作数（NB_LOW_LEVEL_ACTIONS）
-
-        Returns:
-            mask: [num_actions] 布尔掩码，1=有效动作，0=无效动作
-        """
-        mask = np.zeros(num_actions, dtype=np.float32)
-
-        # 获取有效动作列表
-        valid_actions = self.get_valid_low_level_actions(path_manager, current_tree)
-
-        for action in valid_actions:
-            if 0 <= action < num_actions:
-                mask[action] = 1.0
-
-        return mask
-    def expert_low_level_action(self) -> int:
-        """
-        返回上一步专家推荐的低层动作（用于 DAgger 奖励）
-
-        注意：需要在 get_best_plan() 中记录 self.last_expert_action
-
-        Returns:
-            action: 专家动作索引，-1 表示无法获取
-        """
-        return getattr(self, 'last_expert_action', -1)
+    def get_low_level_action_mask(self, *args, **kwargs):
+        return np.ones(100, dtype=np.float32)

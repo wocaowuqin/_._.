@@ -1,4 +1,6 @@
-#中层选择路径import torch
+# core/hrl/mid_policy.py
+
+import torch
 import torch.nn as nn
 
 class MidLevelPolicy(nn.Module):

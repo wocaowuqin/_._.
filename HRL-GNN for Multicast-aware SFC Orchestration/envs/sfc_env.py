@@ -193,8 +193,10 @@ class SFC_HIRL_Env(gym.Env):
         else:
             return self.data_loader.load_dataset(phase_or_req_file)
 
-    def reset(self, phase: str = "phase3"):
-        """重置环境并开始新 episode"""
+    def _reset_core(self):
+        """
+        环境级 reset（不加载数据集、不推进请求）
+        """
         self.resource_mgr.reset()
         self.data_loader.reset()
         self.path_manager.reset()
@@ -205,37 +207,56 @@ class SFC_HIRL_Env(gym.Env):
         self.total_requests_accepted = 0
         self._state_visit_counter.clear()
         self._prev_dist = None
+        self.phase_done = False
 
+    def reset(self, *, seed=None, options=None):
+        """
+        Gym / Phase3 专用 reset
+        """
+        super().reset(seed=seed)
+
+        phase = "phase3"
+        if options is not None:
+            phase = options.get("phase", phase)
+
+        logger.info(f"[Env] reset() called, phase={phase}")
+
+        # 核心清理
+        self._reset_core()
+
+        # 加载数据集（只在 reset 做）
         if not self.load_dataset(phase):
             raise RuntimeError(f"Failed to load dataset for {phase}")
 
-        self._reset_current_request()
-        return self.get_state()
+        # 初始化第一个请求
+        req, _ = self.reset_request()
+
+        obs = self.get_state()
+        info = {"phase": phase}
+
+        return obs, info
 
     def reset_request(self) -> Tuple[Optional[Dict], Any]:
         """
-        重置并获取下一个请求（旧环境的核心接口）
-
-        Phase 1 数据收集器和 Phase 3 训练器都依赖这个方法
-
-        Returns:
-            (request, state): 请求字典和当前状态
+        重置并推进到下一个请求
+        Phase1 / Phase2 / Phase3 共用
         """
-        # 清空缓存
+
+        # 清理 request 级缓存
         self.policy_helper.clear_cache()
         self.current_request = None
         self._prev_dist = None
 
-        # 通知 RewardCritic 新请求开始
+        # 通知奖励模块
         self.reward_critic.on_new_request()
 
-        # 从 DataLoader 获取下一个到达的请求
-        while self.current_request is None:
+        # === 核心：推进时间直到出现 arrival ===
+        while True:
             # 处理离开事件
             leaves = self.data_loader.get_current_leaves()
             self.event_handler.process_leaves(leaves)
 
-            # 获取到达事件
+            # 获取到达请求
             arrivals = self.data_loader.get_current_arrivals()
             if arrivals:
                 self.current_request = arrivals[0]
@@ -244,36 +265,30 @@ class SFC_HIRL_Env(gym.Env):
             # 推进时间
             self.data_loader.advance_time()
 
-            # 检查是否结束
+            # 数据集结束
             if self.data_loader.is_done():
-                break
+                logger.info("[Env] No more requests in dataset")
+                return None, self.get_state()
 
-        # 如果没有请求，返回 None
-        if self.current_request is None:
-            return None, self.get_state()
-
-        # 初始化请求状态
+        # ===== 初始化请求级状态 =====
         self.total_requests_seen += 1
-        dests = self.current_request.get('dest', [])
+        req = self.current_request
 
-        # 初始化未完成目标集合
+        dests = req.get("dest", [])
         self.unadded_dest_indices = set(range(len(dests)))
 
-        # 初始化树
+        self.nodes_on_tree = {req["source"]}
+
         self.current_tree = {
-            'id': self.current_request['id'],
-            'tree': np.zeros(self.resource_mgr.L),
-            'hvt': np.zeros((self.resource_mgr.n, self.resource_mgr.K_vnf)),
-            'paths_map': {}
+            "id": req["id"],
+            "tree": np.zeros(self.resource_mgr.L, dtype=np.float32),
+            "hvt": np.zeros((self.resource_mgr.n, self.resource_mgr.K_vnf), dtype=np.float32),
+            "paths_map": {}
         }
 
-        # 初始化树上的节点
-        self.nodes_on_tree = {self.current_request['source']}
-
-        # 重置 PathManager
         self.path_manager.reset()
 
-        return self.current_request, self.get_state()
+        return req, self.get_state()
 
     def _reset_current_request(self):
         """内部使用：获取下一个到达的请求并初始化树结构"""
@@ -485,7 +500,20 @@ class SFC_HIRL_Env(gym.Env):
         """兼容 gym 标准 step（仅低层）"""
         state, reward, sub_done, req_done, info = self.step_low_level(action)
         return state, reward, req_done, info
+    def get_next_request_only(self):
+        """
+        Phase1 专用：只取请求，不初始化 rollout 状态
+        """
+        return self.data_loader.next_request()
 
+    def get_network_state_snapshot(self):
+        """
+        Phase1 专用：给专家用的静态网络状态
+        """
+        return {
+            "node_cap": self.resource_mgr.node_cap.copy(),
+            "link_cap": self.resource_mgr.link_cap.copy(),
+        }
     # =========================================================================
     # 5. 动作解码与掩码
     # =========================================================================
@@ -779,3 +807,44 @@ class SFC_HIRL_Env(gym.Env):
 
         if hasattr(self, '_eval_cache'):
             self._eval_cache.clear()
+
+    # =========================================================================
+    # 🔥 Phase 1 专用接口 (请添加到 SFC_HIRL_Env 类中)
+    # =========================================================================
+    def prepare_phase1_iterator(self):
+        """Phase 1 初始化：创建一个直接遍历所有请求的迭代器"""
+        if not hasattr(self.data_loader, 'requests') or not self.data_loader.requests:
+            logger.error("Data loader is empty! Did you call load_dataset('phase1')?")
+            self._phase1_iter = iter([])
+        else:
+            self._phase1_iter = iter(self.data_loader.requests)
+            logger.info(f"Phase 1 iterator ready: {len(self.data_loader.requests)} requests.")
+
+    def get_next_request_only(self):
+        """Phase 1 核心：不随时间推进，直接拿下一个请求"""
+        try:
+            # 1. 拿下一个请求
+            if not hasattr(self, '_phase1_iter'):
+                self.prepare_phase1_iterator()
+
+            req = next(self._phase1_iter)
+
+            # 2. 手动初始化环境状态 (模拟 _reset_current_request 的部分逻辑)
+            self.current_request = req
+            self.total_requests_seen += 1
+
+            # 初始化树结构
+            self.nodes_on_tree = {req['source']}
+            self.unadded_dest_indices = set(range(len(req['dest'])))
+            self.current_tree = {
+                'id': req['id'],
+                'tree': np.zeros(self.resource_mgr.L, dtype=np.float32),
+                'hvt': np.zeros((self.resource_mgr.n, self.resource_mgr.K_vnf), dtype=np.float32),
+                'paths_map': {}
+            }
+            self.path_manager.reset()
+            self.policy_helper.clear_cache()
+
+            return req
+        except StopIteration:
+            return None

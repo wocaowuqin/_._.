@@ -14,20 +14,11 @@ import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 from collections import deque
 
-# 假设这些模块在同一包内
-try:
-    from .utils import ensure_list, build_tree_vec, build_hvt_from_placement
-    from .tree_cache import TreeCache
-    from .path_finder import PathFinder
-    from .path_eval import evaluate_path_score
-    from .vnf_placement import VNFPlacement
-except ImportError:
-    # 如果不是包导入，尝试直接导入
-    from utils import ensure_list, build_tree_vec, build_hvt_from_placement
-    from tree_cache import TreeCache
-    from path_finder import PathFinder
-    from path_eval import evaluate_path_score
-    from vnf_placement import VNFPlacement
+from envs.modules.sfc_backup_system.utils import ensure_list, build_tree_vec, build_hvt_from_placement
+from envs.modules.sfc_backup_system.tree_cache import TreeCache
+from envs.modules.sfc_backup_system.path_finder import PathFinder
+from envs.modules.sfc_backup_system.path_eval import evaluate_path_score
+from envs.modules.sfc_backup_system.vnf_placement import VNFPlacement
 
 logger = logging.getLogger(__name__)
 

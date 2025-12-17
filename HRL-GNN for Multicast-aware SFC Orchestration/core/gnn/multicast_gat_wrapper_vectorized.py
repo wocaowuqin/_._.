@@ -18,7 +18,7 @@ import torch.nn.functional as F
 import time
 from typing import Optional, List, Dict, Tuple
 from torch_geometric.nn import global_mean_pool
-from multicast_aware_gat import MulticastAwareGAT
+from .multicast_aware_gat import MulticastAwareGAT
 
 
 class MulticastGATWrapperVectorized(nn.Module):

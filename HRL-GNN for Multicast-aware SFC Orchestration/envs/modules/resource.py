@@ -128,9 +128,9 @@ class ResourceManager:
 
         # 1. 资源容量配置
         self.B_cap = capacities.get('bandwidth', 80.0)
-        self.C_cap = capacities.get('cpu', 60.0)
+        self.C_cap = capacities.get('cpu', 10.0)
         self.M_cap = capacities.get('memory', 80.0)
-        self.K_vnf = 5
+        self.K_vnf = 8
 
         # 保存 DC 节点集合
         self.dc_nodes = list(dc_nodes)
@@ -186,6 +186,38 @@ class ResourceManager:
                 except:
                     pass
             self.hvt_all[node, vnf_t] += 1
+
+    def apply_tree_deployment(self, request: Dict, tree: Dict) -> bool:
+        """
+        请求级部署：一次性应用完整 multicast tree + VNF 布局
+        专供 Phase1 / Expert 使用
+        """
+        try:
+            bw_req = float(request.get('bw_origin', 0.0))
+
+            # ---------- 1. 带宽 ----------
+            for link_idx in np.where(tree['tree'] > 0)[0]:
+                if self.link_ref_count[link_idx] == 0:
+                    self.B[link_idx] = max(0.0, self.B[link_idx] - bw_req)
+                self.link_ref_count[link_idx] += 1
+
+            # ---------- 2. 计算资源 ----------
+            for node, vnf_t in np.argwhere(tree['hvt'] > 0):
+                if self.hvt_all[node, vnf_t] == 0:
+                    try:
+                        j = request['vnf'].index(int(vnf_t + 1))
+                        self.C[node] = max(0.0, self.C[node] - request['cpu_origin'][j])
+                        self.M[node] = max(0.0, self.M[node] - request['memory_origin'][j])
+                    except Exception:
+                        pass
+                self.hvt_all[node, vnf_t] += 1
+
+            return True
+
+        except Exception as e:
+            logger.error(f"[RM] apply_tree_deployment failed: {e}")
+            return False
+
     def _build_shortest_dist_matrix(self):
         """构建最短路矩阵 (简单版，用于Progress计算)"""
         self.shortest_dist = np.full((self.n, self.n), 9999.0)

@@ -1,137 +1,181 @@
+# ================================================================
+# Phase 1 Expert Data Collector (FINAL)
+# Continuous Simulation + Request-level Expert
+# ================================================================
+
 import os
 import pickle
 import logging
-import numpy as np
-from pathlib import Path
 from tqdm import tqdm
+from typing import Dict, List, Any
 
 logger = logging.getLogger(__name__)
 
 
 class Phase1ExpertCollector:
     """
-    阶段 1：专家轨迹采集器
-    利用 PolicyHelper 生成专家数据
+    Phase 1: Expert Data Collection (Continuous Simulation)
+
+    Success:
+        - Expert builds multicast tree
+        - Tree is fully deployable under current residual resources
+
+    Failure:
+        - Expert cannot find feasible deployment
+        - Or resource exhausted during execution
     """
 
-    def __init__(self, env, output_dir, config):
+    def __init__(
+        self,
+        env,
+        expert_solver,
+        output_dir: str,
+        max_episodes: int = 2000,
+        save_every: int = 500,
+    ):
         self.env = env
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.cfg = config
-        self.dataset = []
+        self.expert = expert_solver
 
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        self.max_requests = max_episodes
+        self.save_every = save_every
+
+        # buffers
+        self.success_samples: List[Dict[str, Any]] = []
+        self.fail_contexts: List[Dict[str, Any]] = []
+
+        # stats
         self.stats = {
-            "episodes": 0,
+            "requests": 0,
             "success": 0,
             "fail": 0,
-            "transitions": 0
         }
 
-    def run(self):
-        logger.info("🚀 Starting Phase 1: Expert Data Collection...")
+    def _estimate_load(self) -> float:
+        """
+        估算当前网络负载（用于 Phase2 区分轻载 / 重载）
+        返回值 ∈ [0, 1]
+        """
+        rm = self.env.resource_mgr
 
-        # 确保加载 Phase 1 数据
-        if hasattr(self.env, 'load_dataset'):
-            self.env.load_dataset('phase1')
+        # 带宽利用率
+        bw_util = 1.0 - rm.B.mean() / max(1.0, rm.B_cap)
 
-        num_episodes = self.cfg.get('episodes', 1000)
+        # CPU 利用率
+        cpu_util = 1.0 - rm.C.mean() / max(1.0, rm.C_cap)
 
-        for ep in tqdm(range(num_episodes), desc="Collecting"):
-            try:
-                # 1. 重置环境
-                obs = self.env.reset()
-                req = self.env.current_request
-                if req is None:
-                    break  # 数据跑完
+        # 简单平均
+        return 0.5 * bw_util + 0.5 * cpu_util
 
-                done = False
-                ep_transitions = []
-                success = False
+    # ------------------------------------------------------------
+    # Main entry (CONTINUOUS MODE)
+    # ------------------------------------------------------------
+    def collect(self):
+        logger.info("🚀 Starting Phase 1: Expert Data Collection (Continuous Mode)")
 
-                while not done:
-                    # 2. 获取状态数据
-                    # 注意：如果用GNN，obs是tuple；如果用Flat，obs是np.array
-                    # 这里我们需要保存用于训练的原始状态
+        # 🔥 Only reset ONCE: empty network, start simulation
+        # 务必加上 options={'phase': 'phase1'}，否则它会去跑 Phase 3 的数据
+        self.env.reset(options={'phase': 'phase1'})
 
-                    # 3. 询问专家 (PolicyHelper)
-                    # 获取高层动作建议 (目标选择)
-                    high_cands = self.env.policy_helper.get_expert_candidates(
-                        req, self.env.resource_mgr.get_network_state_dict(req),
-                        self.env.unadded_dest_indices,
-                        self.env.current_tree, self.env.nodes_on_tree
-                    )
+        pbar = tqdm(range(self.max_requests), desc="Collecting", ncols=120)
 
-                    if not high_cands:
-                        break  # 专家无法决策
+        for idx in pbar:
+            # 🔥 Advance time & get next arriving request
+            req, state = self.env.reset_request()
 
-                    expert_high_act = int(high_cands[0][0])  # 最佳目标索引
+            if req is None:
+                logger.info("✓ No more requests in dataset, stop Phase 1")
+                break
 
-                    # 获取低层动作建议 (路径选择)
-                    # 这是一个简化逻辑，实际需要遍历 valid actions 找到专家选择的那条路
-                    # 这里为了演示，我们假设 Env 执行 High Level 后，再问专家 Low Level
+            self.stats["requests"] += 1
+            req_id = req.get("id", "unknown")
 
-                    # 执行 High Level
-                    self.env.step_high_level(expert_high_act)
+            # ----------------------------------------------------
+            # Expert solves under CURRENT residual resources
+            # ----------------------------------------------------
+            network_state = self.env.resource_mgr.get_network_state_dict(req)
 
-                    # 询问 Low Level (PolicyHelper.get_best_plan 内部含专家逻辑)
-                    # 我们需要把专家的决策转化为 action index
-                    # 由于这部分逻辑较复杂，通常Phase1只采集"成功路径"的特征
-                    # 这里简化为：直接采集 (State, High_Action) 和 (State, Low_Action)
+            expert_result = self.expert.solve_request_for_expert(
+                request=req,
+                network_state=network_state
+            )
 
-                    # 暂存数据 (State, High_Action)
-                    # 注意：这里只演示高层策略采集，完整版需要采集低层
-                    ep_transitions.append({
-                        'state': obs,
-                        'high_action': expert_high_act,
-                        # 'low_action': ... (需要反推 action index)
-                    })
+            success = False
 
-                    # 执行一步 Low Level (使用专家决策)
-                    # 这里实际上应该调用 env.policy_helper.get_best_plan 获取 plan
-                    # 然后反推 action ID。为简化，直接让环境跑一步专家动作
-                    # 假设我们只训练高层策略，或者低层策略单独处理
+            if expert_result is not None:
+                tree, traj = expert_result
 
-                    # 模拟环境推进 (这里为了不中断流程，使用随机或简单的逻辑推进)
-                    # 在真实实现中，这里必须执行专家的 plan
-                    valid_low = self.env.policy_helper.get_valid_low_level_actions(
-                        self.env.path_manager, self.env.current_tree
-                    )
-                    low_act = valid_low[0]  # 占位
+                # Try to deploy on env (真实资源扣减)
+                # 使用 tree 专用接口，更稳健
+                ok = self.env.resource_mgr.apply_tree_deployment(req, tree)
 
-                    next_obs, reward, sub_done, req_done, info = self.env.step_low_level(low_act)
+                if ok:
+                    success = True
 
-                    obs = next_obs
-                    done = req_done
+                    # register service for future leave
+                    self.env.event_handler.register_service(req_id, tree)
 
-                    if done and info.get('success', False):
-                        success = True
+                    for (dest_idx, action, cost) in traj:
+                        self.success_samples.append({
+                            "request": req,
+                            "dest_idx": dest_idx,
+                            "action": action,
+                            "cost": cost,
+                            # 可选：记录当时的负载，用于 Phase2 分流
+                            "load": self._estimate_load(),
+                        })
 
-                # 4. 如果整个请求成功，保存轨迹
-                if success:
-                    self.dataset.extend(ep_transitions)
-                    self.stats['success'] += 1
-                    self.stats['transitions'] += len(ep_transitions)
-                else:
-                    self.stats['fail'] += 1
+            # ----------------------------------------------------
+            # Failure handling (BLOCKING)
+            # ----------------------------------------------------
+            if not success:
+                self.stats["fail"] += 1
 
-                self.stats['episodes'] += 1
+                # record fail context for Phase2
+                self.fail_contexts.append({
+                    "request": req,
+                    "network_state": network_state,
+                    "reason": "resource_blocking"
+                })
+            else:
+                self.stats["success"] += 1
 
-                # 定期保存
-                if ep % self.cfg.get('save_every', 500) == 0:
-                    self._save_data(f"expert_data_ep{ep}.pkl")
+            # ----------------------------------------------------
+            # Logging & saving
+            # ----------------------------------------------------
+            if (idx + 1) % self.save_every == 0:
+                self._save_partial(idx + 1)
 
-            except Exception as e:
-                logger.error(f"Ep {ep} Error: {e}")
-                continue
+            br = self.stats["fail"] / max(1, self.stats["requests"])
+            pbar.set_postfix(
+                succ=self.stats["success"],
+                fail=self.stats["fail"],
+                BR=f"{br:.2%}"
+            )
 
-        # 最终保存
-        self._save_data("expert_data_final.pkl")
-        logger.info(f"Phase 1 Done. Stats: {self.stats}")
-        return self.dataset
+        self._save_final()
+        logger.info(f"✓ Phase 1 Done. Stats: {self.stats}")
+        return self.stats
 
-    def _save_data(self, filename):
-        path = self.output_dir / filename
-        with open(path, 'wb') as f:
-            pickle.dump(self.dataset, f)
-        logger.info(f"Saved {len(self.dataset)} samples to {path}")
+    # ------------------------------------------------------------
+    # Saving
+    # ------------------------------------------------------------
+    def _save_partial(self, idx: int):
+        path = os.path.join(self.output_dir, f"expert_data_part_{idx}.pkl")
+        with open(path, "wb") as f:
+            pickle.dump({
+                "success": self.success_samples,
+                "fail": self.fail_contexts
+            }, f)
+        logger.info(f"[Expert] Saved partial data to {path}")
+
+    def _save_final(self):
+        path = os.path.join(self.output_dir, "expert_data_final.pkl")
+        with open(path, "wb") as f:
+            pickle.dump({
+                "success": self.success_samples,
+                "fail": self.fail_contexts
+            }, f)
+        logger.info(f"[Expert] Saved final data to {path}")

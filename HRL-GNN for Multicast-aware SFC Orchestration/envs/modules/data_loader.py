@@ -2,12 +2,13 @@ import pickle
 import os
 import logging
 import numpy as np
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
 class DataLoader:
-    """数据加载器：管理请求序列和事件序列"""
+    """数据加载器：最终修复版 (支持 arrive_event/leave_event 键名)"""
 
     def __init__(self, config: dict):
         self.cfg = config
@@ -17,148 +18,138 @@ class DataLoader:
         self.time_step = 0
         self.total_steps = 0
 
-    def load_dataset(self, phase: str) -> bool:
-        """
-        根据阶段或文件名加载数据集（支持两种调用方式）
-
-        调用方式1: load_dataset("phase3")
-                  自动推断文件名为 phase3_requests.pkl 和 phase3_events.pkl
-
-        调用方式2: load_dataset("phase3_requests.pkl", "phase3_events.pkl")
-                  直接指定文件名（旧环境兼容）
-
-        Args:
-            phase_or_req_file: 阶段名（如 "phase3"）或请求文件名
-            events_file: 事件文件名（可选，提供时使用文件名方式）
-
-        Returns:
-            bool: 加载是否成功
-        """
-        # 方式2：文件名方式（旧环境兼容）
+    def load_dataset(self, phase_or_req_file: str, events_file: Optional[str] = None) -> bool:
+        # --- 路径查找逻辑 (保持不变) ---
         if events_file is not None:
-            # 尝试多个可能的数据目录
+            req_filename = phase_or_req_file
             possible_dirs = [
                 self.cfg['path'].get('expert_data_dir', 'data/expert'),
                 'generate_requests_depend_on_poisson/data_output',
                 'data_output',
                 'data/expert',
+                self.cfg['path'].get('input_dir', 'data/input_dir'),
                 '.'
             ]
-
-            req_path = None
-            evt_path = None
-
-            # 查找文件
-            for data_dir in possible_dirs:
-                test_req = os.path.join(data_dir, phase_or_req_file)
-                test_evt = os.path.join(data_dir, events_file)
-
-                if os.path.exists(test_req) and os.path.exists(test_evt):
-                    req_path = test_req
-                    evt_path = test_evt
-                    logger.info(f"Found data files in: {data_dir}")
+            req_path, evt_path = None, None
+            for search_dir in possible_dirs:
+                if not search_dir: continue
+                tr = os.path.join(search_dir, req_filename)
+                te = os.path.join(search_dir, events_file)
+                if os.path.exists(tr) and os.path.exists(te):
+                    req_path, evt_path = tr, te
+                    logger.info(f"Found data files in: {search_dir}")
                     break
-
-            if req_path is None or evt_path is None:
-                logger.error(f"Data files not found: {phase_or_req_file}, {events_file}")
-                logger.error(f"Searched in: {possible_dirs}")
+            if not req_path:
+                logger.error(f"Data files not found: {req_filename}, {events_file}")
                 return False
-
-            # 加载文件
-            try:
-                # 加载请求
-                with open(req_path, 'rb') as f:
-                    self.requests = pickle.load(f)
-                self.req_map = {r['id']: r for r in self.requests}
-
-                # 加载事件
-                with open(evt_path, 'rb') as f:
-                    raw_events = pickle.load(f)
-
-                # 格式化事件
-                self.events = []
-                for evt in raw_events:
-                    self.events.append({
-                        'arrive': np.array(evt.get('arrive', []), dtype=int).flatten(),
-                        'leave': np.array(evt.get('leave', []), dtype=int).flatten()
-                    })
-
-                self.total_steps = len(self.events)
-                self.reset()
-
-                logger.info(f"Loaded files: {len(self.requests)} requests, {self.total_steps} steps")
-                return True
-
-            except Exception as e:
-                logger.error(f"Load failed: {e}")
-                import traceback
-                traceback.print_exc()
-                return False
-
-        # 方式1：阶段名方式（新环境）
+            return self._load_from_paths(req_path, evt_path)
         else:
-            data_dir = self.cfg['path'].get('expert_data_dir', 'data/expert')
-
-            # 根据 phase 自动推断文件名
-            req_file = f"phase_requests.pkl"
-            evt_file = f"phase_events.pkl"
-
-            req_path = os.path.join(data_dir, req_file)
-            evt_path = os.path.join(data_dir, evt_file)
-
+            phase = phase_or_req_file
+            data_dir = self.cfg['path'].get('input_dir', 'data/input_dir')
+            req_path = os.path.join(data_dir, f"{phase}_requests.pkl")
+            evt_path = os.path.join(data_dir, f"{phase}_events.pkl")
             if not os.path.exists(req_path) or not os.path.exists(evt_path):
-                logger.error(f"Data files not found: {req_path}")
-                return False
+                alt_dir = self.cfg['path'].get('expert_data_dir', 'data/expert')
+                req_path = os.path.join(alt_dir, f"{phase}_requests.pkl")
+                evt_path = os.path.join(alt_dir, f"{phase}_events.pkl")
+                if not os.path.exists(req_path) or not os.path.exists(evt_path):
+                    logger.error(f"Data files not found for phase '{phase}'")
+                    return False
+            return self._load_from_paths(req_path, evt_path)
 
-            try:
-                # 加载请求
-                with open(req_path, 'rb') as f:
-                    self.requests = pickle.load(f)
-                self.req_map = {r['id']: r for r in self.requests}
+    def _load_from_paths(self, req_path, evt_path):
+        try:
+            # 1. 加载请求
+            with open(req_path, 'rb') as f:
+                self.requests = pickle.load(f)
 
-                # 加载事件
-                with open(evt_path, 'rb') as f:
-                    raw_events = pickle.load(f)
+            self.req_map = {}
+            for r in self.requests:
+                rid = int(r['id'])
+                r['id'] = rid
+                self.req_map[rid] = r
 
-                # 格式化事件
-                self.events = []
-                for evt in raw_events:
-                    self.events.append({
-                        'arrive': np.array(evt.get('arrive', []), dtype=int).flatten(),
-                        'leave': np.array(evt.get('leave', []), dtype=int).flatten()
-                    })
+            # 2. 加载事件
+            with open(evt_path, 'rb') as f:
+                raw_events = pickle.load(f)
 
-                self.total_steps = len(self.events)
-                self.reset()
+            # 3. 🔥 [关键修复] 适配 arrive_event / leave_event
+            self.events = []
+            all_event_ids = set()
 
-                logger.info(
-                    f"Loaded file dataset: {len(self.requests)} requests, {self.total_steps} steps")
-                return True
+            for i, evt in enumerate(raw_events):
+                arr, lv = [], []
 
-            except Exception as e:
-                logger.error(f"Load failed: {e}")
-                return False
+                # 情况 A: 字典格式
+                if isinstance(evt, dict):
+                    # 🔥 优先检查 arrive_event (您的数据格式)
+                    arr = evt.get('arrive_event', evt.get('arrive', evt.get('arrived', [])))
+                    lv = evt.get('leave_event', evt.get('leave', evt.get('left', [])))
+
+                # 情况 B: 列表/元组格式
+                elif isinstance(evt, (list, tuple, np.ndarray)):
+                    if len(evt) >= 1: arr = evt[0]
+                    if len(evt) >= 2: lv = evt[1]
+
+                # 转换为 int 列表
+                arr = np.array(arr, dtype=int).flatten().tolist()
+                lv = np.array(lv, dtype=int).flatten().tolist()
+
+                self.events.append({'arrive': arr, 'leave': lv})
+                all_event_ids.update(arr)
+
+            self.total_steps = len(self.events)
+            self.reset()
+
+            # 4. ID 对齐检查与修正
+            if len(all_event_ids) > 0:
+                req_ids = set(self.req_map.keys())
+                overlap = req_ids.intersection(all_event_ids)
+
+                if len(overlap) == 0:
+                    logger.warning("⚠️ Request/Event ID 不匹配，正在尝试修复...")
+
+                    # 尝试偏移 -1
+                    shifted_down = {x - 1 for x in all_event_ids}
+                    if len(req_ids.intersection(shifted_down)) > 0:
+                        logger.info("🔧 修复: Event ID - 1 (1-based -> 0-based)")
+                        for e in self.events:
+                            e['arrive'] = [x - 1 for x in e['arrive']]
+                            e['leave'] = [x - 1 for x in e['leave']]
+                    # 尝试偏移 +1
+                    else:
+                        shifted_up = {x + 1 for x in all_event_ids}
+                        if len(req_ids.intersection(shifted_up)) > 0:
+                            logger.info("🔧 修复: Event ID + 1")
+                            for e in self.events:
+                                e['arrive'] = [x + 1 for x in e['arrive']]
+                                e['leave'] = [x + 1 for x in e['leave']]
+                        else:
+                            # 您的请求ID是 1, 20... 如果事件里是 0, 19... 则需要+1
+                            logger.warning("❌ 无法自动对齐 ID，将按原样尝试...")
+            else:
+                logger.warning(f"⚠️ 加载了 {len(self.events)} 个时间步，但似乎所有 arrive_event 都是空的？")
+
+            logger.info(f"Loaded dataset: {len(self.requests)} requests, {self.total_steps} steps")
+            return True
+
+        except Exception as e:
+            logger.error(f"Load failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     def reset(self):
         self.time_step = 0
 
     def get_current_arrivals(self) -> list:
-        """获取当前时间步到达的请求"""
-        if self.time_step >= self.total_steps:
-            return []
-
+        if self.time_step >= self.total_steps: return []
         arrive_ids = self.events[self.time_step]['arrive']
-        reqs = []
-        for rid in arrive_ids:
-            if rid in self.req_map:
-                reqs.append(self.req_map[rid])
-        return reqs
+        return [self.req_map[rid] for rid in arrive_ids if rid in self.req_map]
 
     def get_current_leaves(self) -> list:
-        """获取当前时间步离开的请求ID"""
-        if self.time_step >= self.total_steps:
-            return []
-        return self.events[self.time_step]['leave'].tolist()
+        if self.time_step >= self.total_steps: return []
+        return self.events[self.time_step]['leave']
 
     def advance_time(self):
         self.time_step += 1

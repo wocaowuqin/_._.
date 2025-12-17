@@ -3,8 +3,7 @@ Agent 初始化包装器
 解决 agent_gnn.py 需要 model 和 n_actions 参数的问题
 """
 
-import torch
-from agent.agent_gnn import Agent_SFC_GNN
+from core.hrl.agent.agent_gnn import Agent_SFC_GNN
 from core.hrl.high_policy import HighLevelPolicy
 
 
