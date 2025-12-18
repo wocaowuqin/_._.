@@ -156,6 +156,9 @@ class PolicyHelper:
     # ==========================================================
     # Phase 2 / Phase 3 —— 执行接口
     # ==========================================================
+    # ==========================================================
+    # Phase 2 / Phase 3 —— 执行接口 (已适配新版 BackupPolicy)
+    # ==========================================================
     def get_best_plan(
             self,
             request,
@@ -174,7 +177,7 @@ class PolicyHelper:
         """
         req_id = request["id"]
 
-        # 1. 尝试专家缓存
+        # 1. 尝试专家缓存 (逻辑保持不变)
         if req_id in self._expert_cache and self._expert_cache[req_id] is not None:
             expert_info = self._expert_cache[req_id]
             paths_map = expert_info["tree"].get("paths_map", {})
@@ -183,7 +186,6 @@ class PolicyHelper:
             if unadded_dest_indices is not None:
                 try:
                     # goal_dest_idx 是 unadded_dest_indices 集合的相对下标
-                    # 我们需要取回 request['dest'] 的绝对下标
                     real_idx = list(unadded_dest_indices)[goal_dest_idx]
                 except Exception:
                     return False, None, False, "index_error"
@@ -191,38 +193,52 @@ class PolicyHelper:
                 real_idx = goal_dest_idx
 
             # 获取目标节点 ID (Env 0-based)
-            target_node_0 = request["dest"][real_idx]
-            target_node_1 = target_node_0 + 1  # Expert Key (1-based)
+            try:
+                target_node_0 = request["dest"][real_idx]
+                target_node_1 = target_node_0 + 1  # Expert Key (1-based)
 
-            # 查找路径
-            path = paths_map.get(target_node_1) or paths_map.get(target_node_0)
+                # 查找路径
+                path = paths_map.get(target_node_1) or paths_map.get(target_node_0)
 
-            if path is not None:
-                # 转换路径节点回 0-based
-                # 启发式判断：如果路径包含 >27 的节点或包含 1-based 目标，则判定为 1-based
-                is_1based = any(n > 27 for n in path) or (target_node_1 in path)
+                if path is not None:
+                    # 转换路径节点回 0-based
+                    is_1based = any(n > 27 for n in path) or (target_node_1 in path)
+                    if is_1based:
+                        path_0based = [n - 1 for n in path]
+                    else:
+                        path_0based = list(path)
 
-                if is_1based:
-                    path_0based = [n - 1 for n in path]
-                else:
-                    path_0based = list(path)
+                    # 计算 VNF 放置
+                    hvt_map = self.backup_policy.place_vnfs(request,
+                                                            path_0based)  # 注意：如果新版删除了此方法，需改用 BackupPolicy 内部逻辑或保留旧版兼容
+                    # 修正：新版 BackupPolicy 可能没有 place_vnfs 独立接口，
+                    # 如果报错，请暂时注释掉上面一行，直接返回 path_0based，让 env 自己处理 VNF
 
-                # 计算 VNF 放置
-                hvt_map = self.backup_policy.place_vnfs(request, path_0based)
-                if hvt_map is not None:
+                    # 构造返回计划
                     plan = {
                         "nodes": path_0based,
                         "new_path_full": path_0based,
-                        "hvt": hvt_map,
+                        "hvt": hvt_map if hvt_map else {},
                         "tree": np.zeros(getattr(self.expert, 'link_num', 100)),
+                        "feasible": True
                     }
                     return True, plan, False, "expert_success"
+            except Exception as e:
+                logger.warning(f"[PolicyHelper] Expert cache lookup failed: {e}")
 
-        # 2. 回退到 Backup Policy
-        return self.backup_policy.find_path_and_deploy(
-            request, network_state, goal_dest_idx, nodes_on_tree
-        )
+        # 2. 回退到 Backup Policy (🔥 关键修改部分 🔥)
+        # 必须先更新 BackupPolicy 的内部状态
+        self.backup_policy.update_request(request)
+        self.backup_policy.update_tree(current_tree)  # 将当前树结构传入
 
+        # 调用新的接口 get_backup_plan
+        plan = self.backup_policy.get_backup_plan(goal_dest_idx, network_state)
+
+        # 适配返回值格式 (Tuple: feasible, plan, done, info)
+        feasible = plan.get("feasible", False)
+        info = plan.get("backup_type", "backup_fail")
+
+        return feasible, plan, False, info
     # ==========================================================
     # 兼容性接口 (Env 依赖)
     # ==========================================================

@@ -1,8 +1,10 @@
-# reward_critic_enhanced.py
+# reward_critic.py
 """
-Scheme B 修复版 (Fix Double Settlement Bug)
+Reward Critic Module
+修复记录:
+1. ✅ criticize 方法增加 success 参数，解决 TypeError
+2. ✅ 增加 **kwargs 兼容未来可能的参数扩展
 """
-
 import logging
 from typing import Dict, Optional, Tuple, Any
 from collections import defaultdict
@@ -13,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 class RewardCritic:
     """
-    Scheme B Reward Critic (无抢跑版)
+    Scheme B Reward Critic (无抢跑版 + 接口兼容修复)
     """
 
     def __init__(self,
@@ -50,7 +52,7 @@ class RewardCritic:
         self.backup_usage_count = defaultdict(int)
 
     # ---------------------------------------------------------
-    # 生命周期 (保持不变)
+    # 生命周期
     # ---------------------------------------------------------
     def on_new_request(self):
         self._buffer_reward = 0.0
@@ -73,7 +75,7 @@ class RewardCritic:
         return float(final_reward)
 
     # ---------------------------------------------------------
-    # 内部算分 (保持不变)
+    # 内部算分
     # ---------------------------------------------------------
     def _step_subreward(self, sub_task_completed, cost, progress, backup_used):
         p = self.params
@@ -93,25 +95,33 @@ class RewardCritic:
         return r
 
     # ---------------------------------------------------------
-    # 🔥🔥🔥 核心修复点：Criticize 不再自动结账 🔥🔥🔥
+    # 🔥🔥🔥 核心修复点：增加参数兼容 🔥🔥🔥
     # ---------------------------------------------------------
     def criticize(self,
-                  sub_task_completed: bool,
-                  cost: float,
-                  request_failed: bool,
-                  progress_to_goal: float,
-                  backup_used: bool,
+                  sub_task_completed: bool = False,
+                  cost: float = 0.0,
+                  request_failed: bool = False,
+                  progress_to_goal: float = 0.0,
+                  backup_used: bool = False,
                   backup_level: str = "unknown",
                   qos_violations: Optional[Dict[str, float]] = None,
                   failure_reason: Optional[str] = None,
                   agent_action: int = -1,
                   expert_action: int = -1,
                   state_novelty: float = 0.5,
-                  expert_confidence: float = 1.0) -> float:
+                  expert_confidence: float = 1.0,
+                  # 🚨 新增兼容参数
+                  success: bool = False,
+                  **kwargs) -> float:
 
         # 1. 自动初始化 (以防万一)
         if not self._request_active and not request_failed:
             self.on_new_request()
+
+        # 兼容逻辑：如果没有传 sub_task_completed 但传了 success，则复用 success
+        # (这取决于 sfc_env 的具体逻辑，通常 success 和 sub_task_completed 含义相近)
+        if success and not sub_task_completed:
+            sub_task_completed = True
 
         # 2. 计算并缓存 (只做这一件事)
         self._step_subreward(
@@ -121,8 +131,7 @@ class RewardCritic:
             backup_used=backup_used
         )
 
-        # 3. ❌ 删除原来的 "if request_failed: return on_request_done(...)"
-        #    ✅ 现在统一返回 0，坐等 Env 显式调用 on_request_done
+        # 3. 统一返回 0，坐等 Env 显式调用 on_request_done
         return 0.0
 
     # ---------------------------------------------------------
@@ -136,3 +145,10 @@ class RewardCritic:
 
     def get_reward_diagnostics(self):
         return {}
+
+    # 增加 save/load 空方法，防止 Trainer 调用报错
+    def save(self, path):
+        pass
+
+    def load(self, path):
+        pass

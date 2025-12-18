@@ -180,6 +180,8 @@ class HRL_DQN_Agent:
             goal: 高层目标（可选）
             next_valid_mask: 下一状态的动作掩码（可选）
         """
+        assert next_valid_mask is None, "ReplayBuffer does not support next_valid_mask"
+
         transition = {
             'state': state,
             'action': action,
@@ -337,7 +339,6 @@ class HRL_DQN_Agent:
         logger.info(f"📥 模型已加载: {path}")
         logger.info(f"   Epsilon: {self.epsilon:.4f}")
         logger.info(f"   Steps: {self.steps_done}")
-
 
 def create_agent_from_config(config):
     """

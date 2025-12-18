@@ -457,7 +457,7 @@ class BackupPolicy:
         cpu_res = state.get("cpu", {})
 
         # 计算平均CPU利用率
-        if cpu_res:
+        if cpu_res is not None:
             if isinstance(cpu_res, dict):
                 total_cpu = sum(cpu_res.values())
                 max_cpu = len(cpu_res) * 2000

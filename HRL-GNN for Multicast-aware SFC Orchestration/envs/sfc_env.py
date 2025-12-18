@@ -848,3 +848,16 @@ class SFC_HIRL_Env(gym.Env):
             return req
         except StopIteration:
             return None
+
+    # ==========================================
+    # ✅ 修复 Attribute Error 的关键补丁
+    # ==========================================
+    @property
+    def events(self):
+        """让外部可以直接通过 env.events 访问 data_loader 里的数据"""
+        return self.data_loader.events
+
+    @property
+    def requests(self):
+        """让外部可以直接通过 env.requests 访问 data_loader 里的数据"""
+        return self.data_loader.requests

@@ -276,14 +276,21 @@ class MulticastAwareGAT(nn.Module):
             # 标准GAT传播
             x_gat = gat_layer(x, edge_index, e)  # [num_nodes, hidden_dim]
 
-            # 🔥 请求调制 (动态调整注意力)
-            # ✅ 修复：强制确保 request_vec 是正确维度
-            request_vec_fixed = request_vec
-            while request_vec_fixed.dim() > 1:
-                request_vec_fixed = request_vec_fixed.squeeze(0)
+            # ===== 正确的请求调制（支持 Batch）=====
+            # request_vec: [B, request_dim]
+            assert request_vec.dim() == 2, \
+                f"request_vec must be [B, D], got {request_vec.shape}"
 
-            # 现在 request_vec_fixed 一定是 [request_dim]
-            request_expanded = request_vec_fixed.unsqueeze(0).expand(x.size(0), -1)
+            if batch is None:
+                # 单图 / Phase1 情况
+                request_expanded = request_vec[0].unsqueeze(0).expand(x.size(0), -1)
+            else:
+                # Phase2 Batch：按 batch 索引对齐到每个节点
+                request_expanded = request_vec[batch]  # [num_nodes, request_dim]
+
+            modulation_weights = modulator(
+                x, x, request_expanded
+            )  # [num_nodes, 1]
 
             modulation_weights = modulator(
                 x, x, request_expanded

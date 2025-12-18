@@ -97,6 +97,7 @@ class MSFCE_Solver:
     def __init__(self, path_db_file: Path, topology_matrix: np.ndarray,
                  dc_nodes: List[int], capacities: Dict,
                  config: Optional[SolverConfig] = None):
+        self._recall_failed_req_ids = set()
 
         self.config = config or SolverConfig()
 
@@ -115,12 +116,16 @@ class MSFCE_Solver:
         self.node_num = int(topology_matrix.shape[0])
         self.link_num, self.link_map = self._create_link_map(topology_matrix)
 
-        # VNF 类型和 DC 节点
-        self.type_num = 8
-        self.DC = set(dc_nodes)
+        # VNF 类型和 DC 节点（安全处理）
+        self.type_num = 8  # 默认值，可后续动态覆盖
+        if dc_nodes and min(dc_nodes) == 0:
+            logger.info("[Expert] Converting DC nodes from 0-based to 1-based")
+            self.DC = {n + 1 for n in dc_nodes}
+        else:
+            self.DC = set(dc_nodes)
         self.dc_num = len(dc_nodes)
 
-        # 资源容量
+        # 资源容量（标量转为 float）
         self.cap_cpu = float(capacities['cpu'])
         self.cap_mem = float(capacities['memory'])
         self.cap_bw = float(capacities['bandwidth'])
@@ -180,27 +185,32 @@ class MSFCE_Solver:
         # Step 4: 验证缓存
         self.validate_cache()
 
+        # ========== 关键修复：初始化资源状态模板（全部 float64）==========
+        self.initial_state_template = {
+            'cpu': np.full(self.node_num, self.cap_cpu, dtype=np.float64),  # 节点 CPU 容量
+            'mem': np.full(self.node_num, self.cap_mem, dtype=np.float64),  # 节点 Mem 容量
+            'bw': np.full(self.link_num, self.cap_bw, dtype=np.float64),  # 链路 BW 容量
+            'cpu_load': np.zeros(self.node_num, dtype=np.float64),  # 当前 CPU 负载
+            'mem_load': np.zeros(self.node_num, dtype=np.float64),  # 当前 Mem 负载
+            'bw_load': np.zeros(self.link_num, dtype=np.float64),  # 当前 BW 负载
+            'hvt': np.zeros((self.node_num, self.type_num), dtype=np.float64),  # VNF 实例矩阵
+        }
+
+        logger.info("✓ Resource state template initialized with float64 precision (prevents dtype casting errors)")
         logger.info("=" * 60)
 
         # ========== 初始化诊断 ==========
         logger.info("=" * 60)
-        logger.info("DIAGNOSTIC: Expert MSFCE Initialization")
+        logger.info("DIAGNOSTIC: Expert MSFCE Initialization Complete")
         logger.info("=" * 60)
         logger.info(f"✓ Node count: {self.node_num}")
         logger.info(f"✓ Link count: {self.link_num}")
-        logger.info(f"✓ Type count: {self.type_num}")
+        logger.info(f"✓ VNF type count: {self.type_num}")
         logger.info(f"✓ K-path: {self.k_path}")
-        logger.info(f"✓ DC count: {len(self.DC)}")
-
-        if len(self.DC) == 0:
-            logger.error("✗ ERROR: DC list is EMPTY!")
-        else:
-            dc_sorted = sorted(list(self.DC))
-            logger.info(f"✓ DC nodes (first 10): {dc_sorted[:10]}")
-
-        logger.info(f"✓ Capacities: CPU={self.cap_cpu}, MEM={self.cap_mem}, BW={self.cap_bw}")
+        logger.info(f"✓ DC nodes: {sorted(list(self.DC)) if self.DC else 'None'}")
+        logger.info(f"✓ Capacities: CPU={self.cap_cpu:.1f}, MEM={self.cap_mem:.1f}, BW={self.cap_bw:.1f}")
+        logger.info(f"✓ Path cache entries: {len(self._path_cache)}")
         logger.info("=" * 60)
-
     # ========== 新增：预计算核心方法 ==========
 
     def _build_link_lookup(self):
@@ -257,10 +267,11 @@ class MSFCE_Solver:
     def _load_path_from_db(self, src: int, dst: int, k: int) -> Tuple[List[int], int, List[int]]:
         """
         从PathDB加载单条路径（仅在预计算时调用）
-        这是原 _get_path_info 的精简版，只负责解析数据
+        src, dst 必须是 1-based 索引
         """
         try:
-            # 访问路径数据 (转为0-based索引)
+            # 访问路径数据 (PathDB 是 0-based 数组，所以下标要 -1)
+            # 例如：查找节点 1->2，对应数组下标 [0, 1]
             pinfo = self.path_db[src - 1, dst - 1]
 
             # 检查paths字段
@@ -275,7 +286,7 @@ class MSFCE_Solver:
             idx = k - 1
             path_arr = None
 
-            # 处理不同的数据结构
+            # 处理不同的 MATLAB 数据导出结构
             if raw_paths.dtype == 'O':  # 对象数组
                 flat_data = raw_paths.flatten()
                 if idx < len(flat_data):
@@ -289,35 +300,43 @@ class MSFCE_Solver:
             if path_arr is None:
                 return [], 0, []
 
-            # 获取distance信息
-            dist_k = 0
+            # 转换为扁平数组
+            path_arr_flat = np.array(path_arr).flatten()
+
+            # --- 长度截断逻辑 ---
+            # 获取 distance 信息作为截断依据（如果存在）
+            dist_k = -1
             if 'pathsdistance' in pinfo.dtype.names:
                 raw_dists = pinfo['pathsdistance'].flatten()
                 if idx < len(raw_dists):
                     dist_k = int(raw_dists[idx])
 
-            # 转换为列表并过滤负值
-            path_arr_flat = np.array(path_arr).flatten()
-
-            # 先截取到dist_k+1长度
-            if dist_k > 0:
+            # 如果有有效的 distance，先按 distance + 1 (节点数) 截取
+            # 这样可以避免后面有非零的垃圾数据
+            if dist_k >= 0 and (dist_k + 1) <= len(path_arr_flat):
                 path_segment = path_arr_flat[:dist_k + 1]
             else:
                 path_segment = path_arr_flat
 
-            # 过滤负值和0 (MATLAB填充值)
+            # --- 0值过滤逻辑 (关键) ---
+            # MATLAB 常用 0 做 padding，必须过滤掉
             path_nodes = [int(x) for x in path_segment if int(x) > 0]
 
-            if len(path_nodes) == 0:
+            if len(path_nodes) < 2:  # 路径至少要有起点和终点
                 return [], 0, []
 
-            # ✅ 使用快速链路查找（O(1)时间复杂度）
+            # ✅ 验证起点和终点是否匹配 (可选的安全检查)
+            # if path_nodes[0] != src or path_nodes[-1] != dst:
+            #     # 某些情况下 k-path 可能乱序，这里通常不做强制检查，信任 DB
+            #     pass
+
+            # ✅ 使用快速链路查找
             links = self._compute_links_fast(path_nodes)
 
-            return path_nodes, len(path_nodes) - 1 if len(path_nodes) > 1 else 0, links
+            return path_nodes, len(path_nodes) - 1, links
 
         except Exception as e:
-            logger.debug(f"[PATH] Exception for [{src}->{dst}], k={k}: {e}")
+            # logger.debug(f"[PATH] Exception for [{src}->{dst}], k={k}: {e}")
             return [], 0, []
 
     def _compute_links_fast(self, path_nodes: List[int]) -> List[int]:
@@ -527,20 +546,40 @@ class MSFCE_Solver:
         return lid - 1, link_map
 
     def _normalize_state(self, state: Dict) -> Dict:
-        """标准化状态字典"""
-        normalized = {}
-        normalized['bw'] = state.get('bw', state.get('bandwidth',
-                                                     np.full(self.link_num, self.cap_bw)))
-        normalized['cpu'] = state.get('cpu', np.full(self.node_num, self.cap_cpu))
-        normalized['mem'] = state.get('mem', state.get('memory',
-                                                       np.full(self.node_num, self.cap_mem)))
-        normalized['hvt'] = state.get('hvt', state.get('hvt_all',
-                                                       np.zeros((self.node_num, self.type_num))))
-        normalized['bw_ref_count'] = state.get('bw_ref_count',
-                                               np.zeros(self.link_num))
+        norm = {}
+        norm['cpu'] = np.array(
+            state.get('cpu', np.full(self.node_num, self.cap_cpu)),
+            dtype=float
+        )
+        norm['mem'] = np.array(
+            state.get('mem', np.full(self.node_num, self.cap_mem)),
+            dtype=float
+        )
+        norm['bw'] = np.array(
+            state.get('bw', np.full(self.link_num, self.cap_bw)),
+            dtype=float
+        )
+
+        # 🔥 新增：统一资源负载（关键）
+        norm['cpu_load'] = np.array(
+            state.get('cpu_load', np.zeros(self.node_num)),
+            dtype=float
+        )
+        norm['mem_load'] = np.array(
+            state.get('mem_load', np.zeros(self.node_num)),
+            dtype=float
+        )
+        norm['bw_load'] = np.array(
+            state.get('bw_load', np.zeros(self.link_num)),
+            dtype=float
+        )
+
         if 'request' in state:
-            normalized['request'] = state['request']
-        return normalized
+            norm['request'] = state['request']
+        if 'hvt' in state:
+            norm['hvt'] = state['hvt']
+
+        return norm
 
     def _calc_path_eval(self, nodes: List[int], links: List[int],
                         state: Dict, src_node: int, dst_node: int) -> float:
@@ -594,85 +633,38 @@ class MSFCE_Solver:
                      self.config.beta * term2 +
                      self.config.gamma * term3)
 
-    def _try_deploy_vnf(self, request: Dict, path_nodes: List[int],
-                        state: Dict, existing_hvt: np.ndarray) -> Tuple[bool, np.ndarray, Dict, Dict]:
-        """
-        尝试部署 VNF
-        Returns: (feasible, hvt, placement, resource_delta_or_reason)
-        """
-        req_vnfs = request.get('vnf', [])
-        hvt = existing_hvt.copy()
-        placement = {}
-        path_dcs = [n for n in path_nodes if n in self.DC]
+    def _try_deploy_vnf(
+            self,
+            vnf_id: int,
+            candidate_nodes: List[int],
+            state: Dict,
+            cpu_req: float,
+            mem_req: float,
+            cpu_delta: np.ndarray,
+            mem_delta: np.ndarray
+    ) -> Optional[int]:
 
-        cpu_delta = np.zeros(self.node_num)
-        mem_delta = np.zeros(self.node_num)
+        for node in candidate_nodes:
+            idx = node - 1
 
-        if len(path_dcs) < len(req_vnfs):
-            reason = {
-                'type': 'not_enough_dcs',
-                'required': len(req_vnfs),
-                'available': len(path_dcs),
-                'path': path_nodes
-            }
-            logger.debug(f"Req {request.get('id', '?')}: {reason['type']}")
-            return False, existing_hvt, {}, reason
+            # 🔥 正确剩余资源 = 容量 - 已占用 - 本次 delta
+            remain_cpu = (
+                    state['cpu'][idx]
+                    - state['cpu_load'][idx]
+                    - cpu_delta[idx]
+            )
+            remain_mem = (
+                    state['mem'][idx]
+                    - state['mem_load'][idx]
+                    - mem_delta[idx]
+            )
 
-        current_dc_idx = 0
-        for v_idx, v_type in enumerate(req_vnfs):
-            deployed = False
+            if remain_cpu + 1e-9 >= cpu_req and remain_mem + 1e-9 >= mem_req:
+                cpu_delta[idx] += cpu_req
+                mem_delta[idx] += mem_req
+                return node
 
-            # 1. 尝试复用
-            for node in path_dcs:
-                node_idx = node - 1
-                if node_idx < hvt.shape[0] and (v_type - 1) < hvt.shape[1]:
-                    if hvt[node_idx, v_type - 1] > 0:
-                        placement[v_idx] = node
-                        deployed = True
-                        break
-            if deployed:
-                continue
-
-            # 2. 尝试新部署
-            start_search = current_dc_idx
-            while start_search < len(path_dcs):
-                node = path_dcs[start_search]
-                node_idx = node - 1
-                if node_idx >= len(state['cpu']):
-                    start_search += 1
-                    continue
-
-                cpu_req = request['cpu_origin'][v_idx]
-                mem_req = request['memory_origin'][v_idx]
-
-                curr_cpu = state['cpu'][node_idx] - cpu_delta[node_idx]
-                curr_mem = state['mem'][node_idx] - mem_delta[node_idx]
-
-                if curr_cpu >= cpu_req and curr_mem >= mem_req:
-                    cpu_delta[node_idx] += cpu_req
-                    mem_delta[node_idx] += mem_req
-                    hvt[node_idx, v_type - 1] = 1
-                    placement[v_idx] = node
-                    deployed = True
-                    current_dc_idx = start_search + 1
-                    break
-                else:
-                    start_search += 1
-
-            if not deployed:
-                reason = {
-                    'type': 'resource_shortage',
-                    'vnf_idx': v_idx,
-                    'vnf_type': v_type,
-                    'cpu_required': request['cpu_origin'][v_idx],
-                    'mem_required': request['memory_origin'][v_idx],
-                    'checked_nodes': [path_dcs[i] for i in range(current_dc_idx, len(path_dcs))]
-                }
-                logger.debug(f"Req {request.get('id', '?')}: VNF {v_idx} resource_shortage")
-                return False, existing_hvt, {}, reason
-
-        resource_delta = {'cpu': cpu_delta, 'mem': mem_delta}
-        return True, hvt, placement, resource_delta
+        return None
 
     def _evaluate_otv(self, request: Dict, tree_links: np.ndarray, hvt: np.ndarray) -> float:
         """计算 OTV 成本"""
@@ -683,10 +675,12 @@ class MSFCE_Solver:
 
     def _validate_resource_deduction(self, state: Dict, resource_delta: Dict,
                                      request: Dict, links_used: Optional[List[int]] = None) -> bool:
+        logger.debug("Validating resource deduction...")
         """完整资源验证（含带宽）"""
         cpu_d = resource_delta.get('cpu', np.zeros(self.node_num))
         mem_d = resource_delta.get('mem', np.zeros(self.node_num))
-
+        logger.debug(f"CPU Delta: {cpu_d}")
+        logger.debug(f"Memory Delta: {mem_d}")
         # 形状验证
         if cpu_d.shape != (self.node_num,) or mem_d.shape != (self.node_num,):
             logger.error(f"Shape mismatch: cpu{cpu_d.shape}, mem{mem_d.shape}")
@@ -708,6 +702,7 @@ class MSFCE_Solver:
         # 带宽验证
         if links_used:
             bw_required = request.get('bw_origin', 0.0)
+            logger.debug(f"Checking bandwidth requirement: {bw_required}")
             for lid in links_used:
                 idx = lid - 1
                 if idx < len(state['bw']):
@@ -717,24 +712,47 @@ class MSFCE_Solver:
 
         return True
 
-    def _apply_path_to_tree(self, tree_struct, info, request, state,
-                            real_deploy=False, resource_delta=None):
-        """应用路径到树（带回滚）"""
+    def _apply_path_to_tree(self, tree_struct: Dict, info: Dict, request: Dict, state: Dict,
+                            real_deploy: bool = False, resource_delta: Dict = None) -> bool:
+        """
+        应用路径到树（标准版接口：info 包含 nodes/links）
+        Signature: (tree, info, req, state, deploy, delta)
+        """
         nodes = info['nodes']
-        links_used = []
 
-        # 更新链路
-        for i in range(len(nodes) - 1):
-            u, v = nodes[i], nodes[i + 1]
-            if (u, v) in self.link_map:
-                lid = self.link_map[(u, v)]
-                idx = lid - 1
-                links_used.append(lid)
-                if idx < len(tree_struct['tree']):
-                    if tree_struct['tree'][idx] == 0:
-                        tree_struct['tree'][idx] = 1
-                        if real_deploy and idx < len(state['bw']):
-                            state['bw'][idx] = max(0.0, state['bw'][idx] - request['bw_origin'])
+        # 1. 识别需要扣除带宽的新链路
+        links_to_deduct = []
+        new_links_indices = set()
+
+        # 自动计算 links (如果 info 中没有提供)
+        path_links = info.get('links')
+        if path_links is None:
+            path_links = self._compute_links_fast(nodes)
+
+        for lid in path_links:
+            idx = lid - 1
+            if 0 <= idx < self.link_num:
+                # 只有当前不在树上 (0) 时才标记为新链路
+                if tree_struct['tree'][idx] == 0 and idx not in new_links_indices:
+                    new_links_indices.add(idx)
+                    if real_deploy:
+                        links_to_deduct.append(lid)
+
+        # 2. 资源验证 (仅真实部署时)
+        if real_deploy and resource_delta:
+            # 验证带宽 (仅验证新加入的链路)
+            # 使用 _check_resource_feasibility_safe 或 _validate_resource_deduction
+            # 这里统一用 _check_resource_feasibility_safe (假设您已更新为此名称)
+            if hasattr(self, '_check_resource_feasibility_safe'):
+                if not self._check_resource_feasibility_safe(state, resource_delta, request, links_to_deduct):
+                    return False
+            elif hasattr(self, '_validate_resource_deduction'):
+                if not self._validate_resource_deduction(state, resource_delta, request, links_to_deduct):
+                    return False
+
+        # 3. 更新树结构
+        for idx in new_links_indices:
+            tree_struct['tree'][idx] = 1
 
         tree_struct['nodes'].update(nodes)
         tree_struct['paths_map'][nodes[-1]] = nodes
@@ -742,120 +760,288 @@ class MSFCE_Solver:
         if 'hvt' in info:
             tree_struct['hvt'] = np.maximum(tree_struct['hvt'], info['hvt'])
 
-        # 资源扣减（验证 + 应用）
-        if real_deploy and resource_delta:
-            ok = self._validate_resource_deduction(state, resource_delta, request, links_used)
-            if not ok:
-                raise ValueError("Resource deduction validation failed")
+        # 更新计数器
+        if 'link_count' not in tree_struct: tree_struct['link_count'] = 0
+        if 'node_count' not in tree_struct: tree_struct['node_count'] = 0
+        tree_struct['link_count'] += len(new_links_indices)
+        tree_struct['node_count'] = len(tree_struct['nodes'])
 
-            cpu_d = resource_delta['cpu']
-            mem_d = resource_delta['mem']
-            state['cpu'] = np.maximum(state['cpu'] - cpu_d, 0.0)
-            state['mem'] = np.maximum(state['mem'] - mem_d, 0.0)
+        # 4. 实际扣除资源
+        if real_deploy and resource_delta:
+            state['cpu'] = np.maximum(state['cpu'] - resource_delta['cpu'], 0.0)
+            state['mem'] = np.maximum(state['mem'] - resource_delta['mem'], 0.0)
+
+            bw_req = request.get('bw_origin', 0.0)
+            if bw_req > 0:
+                for lid in links_to_deduct:
+                    idx = lid - 1
+                    if idx < len(state['bw']):
+                        state['bw'][idx] = max(0.0, state['bw'][idx] - bw_req)
+
+        return True
 
     def _apply_path_to_tree_with_rollback(self, tree_struct, info, request, state,
                                           real_deploy=False, resource_delta=None) -> bool:
-        """Rollback 机制"""
-        # 🔥 修复：使用 copy.deepcopy 而不是 .copy()，支持 tuple/list/dict/ndarray
-        original_state = copy.deepcopy({
-            'cpu': state['cpu'],
-            'mem': state['mem'],
-            'bw': state['bw']
-        })
-        original_tree = {
+        """安全回滚机制（适配新接口）"""
+        if not real_deploy:
+            return self._apply_path_to_tree(
+                tree_struct, info, request, state, real_deploy=False, resource_delta=resource_delta
+            )
+
+        # 备份状态
+        backup_state = {
+            'cpu': state['cpu'].copy(),
+            'mem': state['mem'].copy(),
+            'bw': state['bw'].copy(),
+            'hvt': state['hvt'].copy() if 'hvt' in state else None
+        }
+
+        backup_tree = {
             'tree': tree_struct['tree'].copy(),
             'hvt': tree_struct['hvt'].copy(),
             'paths_map': copy.deepcopy(tree_struct['paths_map']),
-            'nodes': set(tree_struct['nodes'])
+            'nodes': set(tree_struct['nodes']),
+            'link_count': tree_struct.get('link_count', 0),
+            'node_count': tree_struct.get('node_count', 0)
         }
 
         try:
-            self._apply_path_to_tree(tree_struct, info, request, state,
-                                     real_deploy, resource_delta)
+            success = self._apply_path_to_tree(
+                tree_struct, info, request, state, real_deploy=True, resource_delta=resource_delta
+            )
+            if not success:
+                raise ValueError("Resource check returned False")
             return True
-        except Exception as e:
-            # 回滚
-            state.update(original_state)
-            tree_struct['tree'] = original_tree['tree']
-            tree_struct['hvt'] = original_tree['hvt']
-            tree_struct['paths_map'] = original_tree['paths_map']
-            tree_struct['nodes'] = original_tree['nodes']
-            logger.error(f"Rollback: {e}")
-            return False
 
+        except Exception:
+            # 恢复状态
+            state['cpu'][:] = backup_state['cpu']
+            state['mem'][:] = backup_state['mem']
+            state['bw'][:] = backup_state['bw']
+            if backup_state['hvt'] is not None and 'hvt' in state:
+                state['hvt'][:] = backup_state['hvt']
+
+            # 恢复树
+            tree_struct['tree'][:] = backup_tree['tree']
+            tree_struct['hvt'][:] = backup_tree['hvt']
+            tree_struct['paths_map'] = backup_tree['paths_map']
+            tree_struct['nodes'] = backup_tree['nodes']
+            tree_struct['link_count'] = backup_tree['link_count']
+            tree_struct['node_count'] = backup_tree['node_count']
+
+            return False
     def _calc_eval(self, request: Dict, d_idx: int, k: int, state: Dict):
-        """返回 8 个值（兼容旧接口）"""
+        """
+        计算单条候选路径的分数和可行性（修复版）
+        返回 8 个值（兼容旧接口）
+        """
         state = self._normalize_state(state)
         src = request['source']
         dst = request['dest'][d_idx]
-        nodes, dist, links = self._get_path_info(src, dst, k)
 
+        # 1. 获取路径信息（节点、距离、链路）
+        nodes, dist, links = self._get_path_info(src, dst, k)
         if not nodes:
             return 0.0, [], np.zeros(self.link_num), np.zeros((self.node_num, self.type_num)), False, dst, 0.0, {}
 
+        # 2. 计算路径基础分数（跳数、距离等）
         score = self._calc_path_eval(nodes, links, state, src, dst)
-        temp_state = copy.deepcopy(state)
-        feasible, new_hvt, placement, _ = self._try_deploy_vnf(
-            request, nodes, temp_state, np.zeros((self.node_num, self.type_num)))
 
+        # 3. 准备临时状态用于试部署
+        temp_state = copy.deepcopy(state)
+        current_hvt = temp_state.get('hvt', np.zeros((self.node_num, self.type_num)))  # 当前已部署 VNF
+
+        # 4. 试部署 VNF（关键修复：补全参数）
+        # 注意：这里是“沿路径部署整个 VNF 链”，不是单个 VNF
+        # 假设你的 _try_deploy_vnf 支持批量部署整条链
+        # 如果不支持，需要循环部署每个 VNF
+
+        # 计算整个链的资源 delta
+        chain = request['vnf']  # [vnf1, vnf2, ..., vnfm]
+        cpu_reqs = request['cpu_origin']  # [cpu1, cpu2, ...]
+        mem_reqs = request['memory_origin']  # [mem1, mem2, ...]
+
+        cpu_delta = np.zeros(self.node_num)
+        mem_delta = np.zeros(self.node_num)
+        vnf_delta = np.zeros((self.node_num, self.type_num))  # 可选，用于实例检查
+
+        # 简化假设：VNF 按顺序放在路径节点上（你实际逻辑可能更复杂）
+        # 这里用一个简单策略：尽量复用已有节点
+        placement = {}  # (node_id, vnf_type) -> placed_node
+        feasible = True
+        new_hvt = current_hvt.copy()
+
+        for j, vnf_type in enumerate(chain):
+            vnf_t = vnf_type - 1  # 1-based → 0-based
+            cpu_req = cpu_reqs[j]
+            mem_req = mem_reqs[j]
+
+            # 尝试在路径节点上找一个可放置的位置（优先已有同类型 VNF 的节点？或任意？）
+            placed = False
+            for node in nodes:  # 沿路径尝试
+                node_idx = node - 1
+
+                # 检查是否已有同类型 VNF（默认不允许重复实例）
+                if new_hvt[node_idx, vnf_t] > 0:
+                    continue  # 已有一个，不能再放（标准 NFV）
+
+                # 临时 delta
+                temp_cpu_delta = cpu_delta.copy()
+                temp_mem_delta = mem_delta.copy()
+                temp_cpu_delta[node_idx] += cpu_req
+                temp_mem_delta[node_idx] += mem_req
+
+                # 调用完整资源检查
+                if self._check_resource_load_feasible(
+                        cpu_delta=temp_cpu_delta,
+                        mem_delta=temp_mem_delta,
+                        vnf_delta=np.zeros((self.node_num, self.type_num)),  # 临时不加
+                        links_used=links,
+                        state=temp_state,
+                        bw_req=request['bw_origin']
+                ):
+                    # 成功放置
+                    cpu_delta[node_idx] += cpu_req
+                    mem_delta[node_idx] += mem_req
+                    new_hvt[node_idx, vnf_t] = 1
+                    vnf_delta[node_idx, vnf_t] = 1
+                    placement[(node, vnf_type)] = node
+                    placed = True
+                    break
+
+            if not placed:
+                feasible = False
+                break
+
+        # 5. 生成 tree_vec
         tree_vec = np.zeros(self.link_num)
         if feasible:
-            for lid in links:
-                if lid - 1 < len(tree_vec):
-                    tree_vec[lid - 1] = 1
+            unique_links = set(links)
+            for lid in unique_links:
+                idx = lid - 1
+                if idx < len(tree_vec):
+                    tree_vec[idx] = 1
 
+        # 6. 计算 OTV 成本
         cost = self._evaluate_otv(request, tree_vec, new_hvt) if feasible else 0.0
+
+        # 7. 返回兼容的 8 元组
         return score, nodes, tree_vec, new_hvt, feasible, dst, cost, placement
 
     def _calc_atnp(self, current_tree: Dict, conn_path: List[int], d_idx: int,
                    state: Dict, nodes_on_tree: Set[int]):
-        """Stage 2: 连接新目标到树"""
-        state = self._normalize_state(state)
+        """Stage 2: 连接新目标到树（高性能优化版 - 移除 deepcopy）"""
+        # state = self._normalize_state(state) # 这一步通常在外部做过了，这里可以注释掉以省时
         request = state.get('request')
         if request is None:
             return {'feasible': False}, 0.0, (0, 0), 0.0
 
+        dst = request['dest'][d_idx]
         best_eval = -1.0
         best_res = None
         best_action = (0, 0)
 
+        # 缓存 HVT 以减少 dict 访问
+        existing_hvt = current_tree.get('hvt', np.zeros((self.node_num, self.type_num)))
+
         for i_idx, conn_node in enumerate(conn_path):
             for k in range(1, self.k_path + 1):
-                nodes, dist, links = self._get_path_info(conn_node, request['dest'][d_idx], k)
+                nodes, dist, links = self._get_path_info(conn_node, dst, k)
 
                 if not nodes or len(nodes) < 2:
                     continue
-                if set(nodes[1:]) & nodes_on_tree:
+                if set(nodes[1:]) & nodes_on_tree:  # 避免环路
                     continue
 
-                score = self._calc_path_eval(nodes, links, state, conn_node, request['dest'][d_idx])
-                if score > best_eval:
-                    temp_state = copy.deepcopy(state)
-                    temp_state['request'] = request
-                    full_nodes = conn_path[:i_idx + 1] + nodes[1:]
-                    existing_hvt = current_tree.get('hvt', np.zeros((self.node_num, self.type_num)))
+                # 快速预估分数，如果显然不如当前最优，直接跳过
+                # score = self._calc_path_eval(...)
+                # if score <= best_eval: continue
 
-                    feasible, new_hvt, placement, res_delta = self._try_deploy_vnf(
-                        request, full_nodes, temp_state, existing_hvt)
+                # 计算分数
+                score = self._calc_path_eval(nodes, links, state, conn_node, dst)
+                if score <= best_eval and best_res is not None:
+                    continue
 
-                    if feasible:
-                        best_eval = score
-                        tree_vec = np.zeros(self.link_num)
-                        for lid in links:
-                            if lid - 1 < len(tree_vec):
-                                tree_vec[lid - 1] = 1
-                        best_res = {
-                            'tree': tree_vec, 'hvt': new_hvt, 'new_path_full': nodes,
-                            'feasible': True, 'placement': placement, 'res_delta': res_delta
-                        }
-                        best_action = (i_idx, k - 1)
+                # ===== ⚡️ 优化核心：直接计算 Delta，不复制 State ⚡️ =====
+                # 我们不需要 temp_state，只需要计算出增量(delta)，然后拿增量去跟 state 对比即可
+
+                # 1. 准备增量容器
+                cpu_delta = np.zeros(self.node_num)
+                mem_delta = np.zeros(self.node_num)
+                vnf_delta = np.zeros((self.node_num, self.type_num))
+
+                # 2. 模拟 VNF 放置 (逻辑保持不变)
+                full_nodes = conn_path[:i_idx + 1] + nodes[1:]
+                chain = request['vnf']
+                cpu_reqs = request['cpu_origin']
+                mem_reqs = request['memory_origin']
+                placement = {}
+                feasible = True
+
+                for j, vnf_type in enumerate(chain):
+                    vnf_t = vnf_type - 1
+                    placed = False
+                    for n in full_nodes:
+                        n_idx = n - 1
+                        # 逻辑：优先复用，其次放空节点
+                        if existing_hvt[n_idx, vnf_t] > 0:
+                            placement[(n, vnf_type)] = n
+                            placed = True
+                            break
+                        # 注意：这里放宽了限制，不再要求 np.sum(hvt)==0，只要该类型没被占用且资源够即可
+                        # 这样可以允许不同类型的 VNF 共享同一个节点
+                        if vnf_delta[n_idx, vnf_t] == 0:
+                            cpu_delta[n_idx] += cpu_reqs[j]
+                            mem_delta[n_idx] += mem_reqs[j]
+                            vnf_delta[n_idx, vnf_t] = 1
+                            placement[(n, vnf_type)] = n
+                            placed = True
+                            break
+                    if not placed:
+                        feasible = False
+                        break
+
+                if not feasible:
+                    continue
+
+                # 3. 资源检查 (直接传入 state 和 delta)
+                # 🔥 这里不再需要 temp_state
+                if not self._check_resource_load_feasible(
+                        cpu_delta=cpu_delta,
+                        mem_delta=mem_delta,
+                        vnf_delta=vnf_delta,
+                        links_used=links,
+                        state=state,  # 传原始 state
+                        bw_req=request['bw_origin']
+                ):
+                    continue
+
+                # 4. 记录结果
+                tree_vec = np.zeros(self.link_num)
+                unique_links = set(links)
+                for lid in unique_links:
+                    if 0 < lid <= self.link_num:  # 边界保护
+                        tree_vec[lid - 1] = 1
+
+                new_hvt = existing_hvt.copy()  # 只有确定的结果才需要 copy
+                new_hvt += vnf_delta
+
+                best_eval = score
+                best_res = {
+                    'tree': tree_vec,
+                    'hvt': new_hvt,
+                    'new_path_full': full_nodes,
+                    'feasible': True,
+                    'placement': placement,
+                    'res_delta': {'cpu': cpu_delta, 'mem': mem_delta, 'vnf': vnf_delta}
+                }
+                best_action = (i_idx, k - 1)
 
         if best_res:
             cost = self._evaluate_otv(request, best_res['tree'], best_res['hvt'])
             return best_res, best_eval, best_action, cost
         else:
             return {'feasible': False}, 0.0, (0, 0), 0.0
-
     def _check_resource_feasibility(self, request: Dict, state: Dict) -> bool:
         """快速全局资源检查"""
         total_cpu_req = sum(request.get('cpu_origin', []))
@@ -880,187 +1066,152 @@ class MSFCE_Solver:
             return min(2, self.config.lookahead_depth)
         else:
             return 1
+    def links_from_t_vec(self, t_vec: np.ndarray) -> List[int]:
+        """
+        从 tree_vec（链路向量）提取被使用的链路 ID 列表（1-based）
 
-    def _construct_tree(self, request: Dict, network_state: Dict,
-                        forced_first_dest_idx: Optional[int] = None) -> Tuple[Optional[Dict], List]:
-        """核心树构建逻辑（含候选集 + Lookahead）"""
+        Args:
+            t_vec: np.ndarray, shape (link_num,), 值 >0 表示该链路在树中
+
+        Returns:
+            List[int]: 链路 ID 列表（1-based，与你的 lid 一致）
+        """
+        if t_vec is None or len(t_vec) == 0:
+            return []
+
+        # 找到 >0 的位置（0-based 索引），然后 +1 转为 1-based ID
+        used_indices = np.where(t_vec > 0)[0]  # 返回数组
+        link_ids = (used_indices + 1).tolist()  # 转为 1-based list
+
+        return link_ids
+
+    def _construct_tree(
+            self,
+            request: Dict,
+            network_state: Dict,
+            forced_first_dest_idx: Optional[int] = None
+    ) -> Tuple[Optional[Dict], List, List]:
+        """
+        Construct multicast tree with Beam Search.
+        RETURN (ALWAYS 3 VALUES):
+            tree (or None),
+            traj (list),
+            failed_dest_indices (list)
+        """
+        import copy
         start_time = time.time()
-        iteration_count = 0
 
-        current_sim_state = copy.deepcopy(network_state)
-        dest_indices = list(range(len(request['dest'])))
-
-        current_tree = {
+        # =====================================================
+        # 1. Initialization
+        # =====================================================
+        initial_tree = {
             'id': request['id'],
             'tree': np.zeros(self.link_num),
             'hvt': np.zeros((self.node_num, self.type_num)),
             'paths_map': {},
             'nodes': {request['source']},
             'added_dest_indices': [],
-            'traj': []
+            'traj': [],
+            'link_count': 0,
+            'node_count': 1
         }
-        ordered_paths = []
 
-        MAX_CANDIDATES = int(self.config.max_candidates)
-        MAX_ITER = int(self.config.max_iterations)
-        MAX_TIME = float(self.config.max_time_seconds)
+        BEAM_SIZE = 3
+        candidate_trees = [(initial_tree, 0.0)]
 
-        while len(current_tree['added_dest_indices']) < len(dest_indices):
-            iteration_count += 1
+        dest_indices = list(range(len(request['dest'])))
+        final_completed_trees = []
 
-            if iteration_count > MAX_ITER:
-                logger.warning(f"Req {request['id']}: Max iterations ({MAX_ITER}) reached")
-                return None, [d for d in dest_indices if d not in current_tree['added_dest_indices']]
+        # =====================================================
+        # 2. Beam Search expansion
+        # =====================================================
+        for step in range(len(dest_indices)):
+            if time.time() - start_time > self.config.max_time_seconds:
+                break
 
-            if time.time() - start_time > MAX_TIME:
-                logger.warning(f"Req {request['id']}: Timeout ({MAX_TIME}s) reached")
-                return None, [d for d in dest_indices if d not in current_tree['added_dest_indices']]
+            next_generation = []
 
-            unadded = [d for d in dest_indices if d not in current_tree['added_dest_indices']]
-            candidates = []
+            for curr_tree, curr_score in candidate_trees:
+                unadded = [
+                    d for d in dest_indices
+                    if d not in curr_tree['added_dest_indices']
+                ]
 
-            # A. 候选集生成
-            if not ordered_paths:
-                # Stage 1: Source -> Dest
-                targets = [forced_first_dest_idx] if forced_first_dest_idx is not None else unadded
-                for d_idx in targets:
-                    if d_idx not in unadded:
-                        continue
-                    if len(candidates) >= MAX_CANDIDATES:
-                        break
-
-                    for k in range(1, self.k_path + 1):
-                        score, nodes, t_vec, h_vec, feas, _, cost, pl = self._calc_eval(
-                            request, d_idx, k, current_sim_state)
-
-                        if feas:
-                            _, _, _, res_delta = self._try_deploy_vnf(
-                                request, nodes, current_sim_state,
-                                np.zeros((self.node_num, self.type_num)))
-
-                            info = {
-                                'nodes': nodes, 'k': k, 'score': score, 'p_idx': 0,
-                                'res_delta': res_delta, 'hvt': h_vec, 'tree_vec': t_vec,
-                                'placement': pl, 'd_idx': d_idx
-                            }
-                            candidates.append(info)
-            else:
-                # Stage 2: Tree -> New Dest
-                for p_idx, path in enumerate(ordered_paths):
-                    for d_idx in unadded:
-                        if len(candidates) >= MAX_CANDIDATES:
-                            break
-
-                        res, score, action_in_path, _ = self._calc_atnp(
-                            current_tree, path, d_idx, current_sim_state, current_tree['nodes'])
-
-                        if res and res.get('feasible'):
-                            k = action_in_path[1] + 1
-                            info = {
-                                'nodes': res['new_path_full'], 'k': k, 'score': score,
-                                'p_idx': p_idx, 'conn_idx_in_path': action_in_path[0],
-                                'res_delta': res['res_delta'], 'hvt': res['hvt'],
-                                'tree_vec': res['tree'], 'placement': res['placement'],
-                                'd_idx': d_idx
-                            }
-                            candidates.append(info)
-
-            if not candidates:
-                return None, unadded
-
-            # B. 候选集排序
-            candidates.sort(key=lambda x: x['score'], reverse=True)
-            candidate_set = candidates[:int(self.config.candidate_set_size)]
-
-            # C. Lookahead 选择
-            best_global_otv = float('inf')
-            selected_info = None
-            current_lookahead_depth = self._get_adaptive_lookahead_depth(len(unadded) - 1)
-
-            for info in candidate_set:
-                d_idx = info['d_idx']
-
-                temp_tree_sim = copy.deepcopy(current_tree)
-                temp_state_sim = copy.deepcopy(current_sim_state)
-
-                applied = self._apply_path_to_tree_with_rollback(
-                    temp_tree_sim, info, request, temp_state_sim,
-                    real_deploy=True, resource_delta=info.get('res_delta'))
-
-                if not applied:
+                if not unadded:
+                    final_completed_trees.append((curr_tree, curr_score))
                     continue
 
-                # Lookahead
-                remaining_after = [d for d in unadded if d != d_idx]
-                subsequent_count = 0
+                targets_to_try = unadded
+                if step == 0 and forced_first_dest_idx is not None:
+                    targets_to_try = [forced_first_dest_idx]
 
-                while subsequent_count < current_lookahead_depth and remaining_after:
-                    next_candidates = []
-                    current_sim_paths = list(temp_tree_sim['paths_map'].values()) \
-                        if temp_tree_sim['paths_map'] else [[request['source']]]
+                for d_idx in targets_to_try:
+                    res, score, action, cost = self._calc_atnp(
+                        curr_tree,
+                        list(curr_tree['nodes']),
+                        d_idx,
+                        network_state,
+                        curr_tree['nodes']
+                    )
 
-                    for next_d_idx in remaining_after:
-                        for path in current_sim_paths:
-                            res, score, _, _ = self._calc_atnp(
-                                temp_tree_sim, path, next_d_idx,
-                                temp_state_sim, temp_tree_sim['nodes'])
+                    if not res['feasible']:
+                        continue
 
-                            if res and res.get('feasible'):
-                                next_candidates.append((score, next_d_idx, res))
+                    new_tree = copy.deepcopy(curr_tree)
 
-                    if not next_candidates:
-                        break
+                    success = self._apply_path_to_tree(
+                        new_tree,
+                        {'nodes': res['new_path_full'], 'hvt': res['hvt']},
+                        request,
+                        network_state,
+                        real_deploy=False,
+                        resource_delta=res['res_delta']
+                    )
 
-                    next_candidates.sort(key=lambda x: x[0], reverse=True)
-                    best_score, best_next_d, best_res = next_candidates[0]
+                    if not success:
+                        continue
 
-                    temp_info_next = {
-                        'nodes': best_res['new_path_full'],
-                        'hvt': best_res['hvt'],
-                        'tree_vec': best_res['tree']
-                    }
+                    new_tree['added_dest_indices'].append(d_idx)
 
-                    applied2 = self._apply_path_to_tree_with_rollback(
-                        temp_tree_sim, temp_info_next, request, temp_state_sim,
-                        real_deploy=True, resource_delta=best_res['res_delta'])
+                    action_tuple = (0, 0, res.get('placement', {}))
+                    new_tree['traj'].append((d_idx, action_tuple, res['res_delta']))
 
-                    if not applied2:
-                        break
+                    new_total_score = curr_score + score
+                    next_generation.append((new_tree, new_total_score))
 
-                    remaining_after.remove(best_next_d)
-                    subsequent_count += 1
+            if not next_generation:
+                break
 
-                otv = self._evaluate_otv(request, temp_tree_sim['tree'], temp_tree_sim['hvt'])
-                if otv < best_global_otv:
-                    best_global_otv = otv
-                    selected_info = info
+            next_generation.sort(key=lambda x: x[1], reverse=True)
+            candidate_trees = next_generation[:BEAM_SIZE]
 
-            # D. 执行最优选择
-            if selected_info:
-                d_idx = selected_info['d_idx']
+        # =====================================================
+        # 3. Final selection
+        # =====================================================
+        all_candidates = final_completed_trees + candidate_trees
 
-                applied = self._apply_path_to_tree_with_rollback(
-                    current_tree, selected_info, request, current_sim_state,
-                    real_deploy=True, resource_delta=selected_info.get('res_delta'))
+        if not all_candidates:
+            # 全部失败
+            return None, [], dest_indices.copy()
 
-                if not applied:
-                    self._record_failure(request.get('id', '?'),
-                                         {'type': 'apply_failed', 'info': 'final apply failed'})
-                    return None, [d for d in dest_indices if d not in current_tree['added_dest_indices']]
+        all_candidates.sort(
+            key=lambda x: (len(x[0]['added_dest_indices']), x[1]),
+            reverse=True
+        )
 
-                current_tree['added_dest_indices'].append(d_idx)
-                ordered_paths.append(selected_info['nodes'])
+        best_tree, _ = all_candidates[0]
 
-                p_idx = selected_info['p_idx']
-                k_idx = selected_info['k'] - 1
-                placement = selected_info.get('placement', {})
-                action_tuple = (p_idx, k_idx, placement)
-                cost = self._evaluate_otv(request, current_tree['tree'], current_tree['hvt'])
-                current_tree['traj'].append((d_idx, action_tuple, cost))
-            else:
-                return None, unadded
+        failed_dests = [
+            d for d in dest_indices
+            if d not in best_tree['added_dest_indices']
+        ]
 
-        return current_tree, current_tree['traj']
+        if failed_dests:
+            # ❗未完全覆盖 → 明确失败，返回失败 dest
+            return None, best_tree['traj'], failed_dests
+
+        # ✅ 全部成功
+        return best_tree, best_tree['traj'], []
 
     def _estimate_destination_resource(self, request: Dict, d_idx: int,
                                        network_state: Dict) -> float:
@@ -1070,25 +1221,52 @@ class MSFCE_Solver:
         bw = request.get('bw_origin', 0.0)
         return float(cpu + mem + bw * 10.0)
 
-    def _enhanced_recall_strategy(self, request: Dict, network_state: Dict,
-                                  failed_unadded: List[int]) -> Tuple[Optional[Dict], List]:
-        """增强 Recall 策略"""
-        if not failed_unadded:
-            return None, []
+    def _enhanced_recall_strategy(self, request, state, failed_dests):
+        """
+        Final fixed recall strategy:
+        - Do NOT shuffle dest list
+        - Shuffle dest indices (construction order)
+        - Prevent infinite recall loop
+        """
+        import copy
+        import random
+        logger.info(f"[Expert] Recall for req {request.get('id', 'unknown')}")
 
-        logger.info(f"Recall for req {request.get('id', '?')} with {len(failed_unadded)} failed dests")
+        max_attempts = 5
+        all_indices = list(range(len(request['dest'])))
 
-        dest_resources = [(d_idx, self._estimate_destination_resource(request, d_idx, network_state))
-                          for d_idx in failed_unadded]
-        dest_resources.sort(key=lambda x: x[1])
+        for attempt in range(max_attempts):
+            logger.info(
+                f"[Expert] Recall attempt {attempt + 1}/{max_attempts} "
+                f"for req {request.get('id', 'unknown')} "
+                f"with {len(failed_dests)} failed dests"
+            )
 
-        for d_idx, _ in dest_resources:
-            recall_tree, recall_traj = self._construct_tree(
-                request, network_state, forced_first_dest_idx=d_idx)
+            temp_state = {
+                'cpu': state['cpu'].copy(),
+                'mem': state['mem'].copy(),
+                'bw': state['bw'].copy(),
+            }
 
-            if recall_tree is not None:
-                logger.info(f"Recall successful using dest {d_idx} first")
-                return recall_tree, recall_traj
+            # 🔥 核心修复：只打乱“构建顺序”，不动 dest 本身
+            shuffled_indices = all_indices[:]
+            random.shuffle(shuffled_indices)
+
+            tree, traj, new_failed = self._construct_tree_with_order(
+                request,
+                temp_state,
+                shuffled_indices
+            )
+
+            # Recall 成功
+            if tree is not None:
+                return tree, traj
+
+        logger.warning("[Expert] Recall failed after max attempts")
+
+        req_id = request.get('id')
+        if req_id is not None:
+            self._recall_failed_req_ids.add(req_id)
 
         return None, []
 
@@ -1172,92 +1350,233 @@ class MSFCE_Solver:
 
         return report
 
-    def solve_request_for_expert(self, request: Dict, network_state: Dict) -> Tuple[Optional[Dict], List]:
+    def solve_request_for_expert(
+            self,
+            request: Dict,
+            network_state: Optional[Dict] = None
+    ) -> Tuple[Optional[Dict], List]:
         """
-        专家算法主入口
+        Expert main entry (FINAL FIXED VERSION)
+        - Correct failed_dests semantics
+        - No recall dead-loop
+        - Respect real network state
         """
+
         start_time = time.time()
         self.metrics['total_requests'] += 1
 
         try:
-            # 🔥🔥🔥 关键修复：State 类型检查和转换 🔥🔥🔥
-            if network_state is None:
-                logger.error("[Expert] network_state is None!")
-                self.metrics['rejected'] += 1
-                return None, []
-
-            # 如果是 tuple 或 list，转换为 dict
-            if isinstance(network_state, (tuple, list)):
-                logger.warning(f"[Expert] Converting {type(network_state).__name__} to dict")
-                if len(network_state) >= 3:
-                    import numpy as np
-                    network_state = {
-                        'cpu': np.array(network_state[0]) if not isinstance(network_state[0], np.ndarray) else
-                        network_state[0],
-                        'mem': np.array(network_state[1]) if not isinstance(network_state[1], np.ndarray) else
-                        network_state[1],
-                        'bw': np.array(network_state[2]) if not isinstance(network_state[2], np.ndarray) else
-                        network_state[2],
-                    }
-                else:
-                    logger.error(f"[Expert] Invalid state format: tuple/list length < 3")
+            # =====================================================
+            # 1. Prepare CURRENT STATE (real remaining resources)
+            # =====================================================
+            if network_state is not None:
+                current_state = {}
+                for k, v in network_state.items():
+                    if isinstance(v, np.ndarray):
+                        current_state[k] = v.astype(np.float64).copy()
+                    else:
+                        current_state[k] = copy.deepcopy(v)
+            else:
+                if not hasattr(self, 'initial_state_template'):
                     self.metrics['rejected'] += 1
                     return None, []
+                current_state = copy.deepcopy(self.initial_state_template)
 
-            # 确保是 dict
-            if not isinstance(network_state, dict):
-                logger.error(f"[Expert] network_state must be dict, got {type(network_state)}")
+            # =====================================================
+            # 2. Request ID alignment (0-based → 1-based)
+            # =====================================================
+            req_internal = copy.deepcopy(request)
+
+            if req_internal['source'] == 0 or any(d == 0 for d in req_internal['dest']):
+                req_internal['source'] += 1
+                req_internal['dest'] = [d + 1 for d in req_internal['dest']]
+
+            current_state['request'] = req_internal
+
+            # =====================================================
+            # 3. Fast resource feasibility check
+            # =====================================================
+            if not self._check_resource_feasibility(req_internal, current_state):
                 self.metrics['rejected'] += 1
                 return None, []
 
-            # 确保资源数组支持 .copy() 方法
-            import numpy as np
-            for key in ['cpu', 'mem', 'bw']:
-                if key in network_state:
-                    if isinstance(network_state[key], (tuple, list)):
-                        network_state[key] = np.array(network_state[key])
-                    elif not isinstance(network_state[key], np.ndarray):
-                        network_state[key] = np.array(network_state[key])
-            # 🔥🔥🔥 修复结束 🔥🔥🔥
-
-            network_state = self._normalize_state(network_state)
-            network_state['request'] = request
-
-            if not self._check_resource_feasibility(request, network_state):
-                logger.warning(f"Req {request.get('id', '?')} skipped: insufficient resources")
-                self.metrics['rejected'] += 1
-                self._record_failure(request.get('id', '?'), {'type': 'global_resource_shortage'})
-                return None, []
-
-            res_tree, res_traj = self._construct_tree(request, network_state)
+            # =====================================================
+            # 4. First attempt: normal MSFCE construction
+            # =====================================================
+            tree, traj, failed_dests = self._construct_tree(req_internal, current_state)
 
             proc_time = time.time() - start_time
             self.metrics['processing_times'].append(proc_time)
 
-            if res_tree is not None:
+            if tree is not None:
                 self.metrics['accepted'] += 1
-                return res_tree, res_traj
+                return tree, traj
 
-            failed_dests = res_traj
-            if failed_dests:
+            # =====================================================
+            # 5. Recall (ONLY if there are failed destinations)
+            # =====================================================
+            req_id = req_internal.get('id')
+
+            if failed_dests and req_id not in self._recall_failed_req_ids:
+                logger.info(
+                    f"[Expert] Recall for req {req_id} with failed dests: {failed_dests}"
+                )
+
+                recall_state = {
+                    'cpu': current_state['cpu'].copy(),
+                    'mem': current_state['mem'].copy(),
+                    'bw': current_state['bw'].copy(),
+                }
+
                 recall_tree, recall_traj = self._enhanced_recall_strategy(
-                    request, network_state, failed_dests)
+                    req_internal,
+                    recall_state,
+                    failed_dests
+                )
 
                 if recall_tree is not None:
                     self.metrics['accepted'] += 1
                     return recall_tree, recall_traj
 
+            # =====================================================
+            # 6. Final failure (NO infinite retry)
+            # =====================================================
             self.metrics['rejected'] += 1
-            self._record_failure(request.get('id', '?'), {'type': 'construct_tree_failed'})
             return None, []
 
         except Exception as e:
-            logger.exception(f"Unexpected error in req {request.get('id', '?')}: {e}")
-            self.metrics['errors'] += 1
+            logger.exception(f"[Expert] Error in solve_request_for_expert: {e}")
             self.metrics['rejected'] += 1
             return None, []
 
+    def _check_resource_load_feasible(
+            self,
+            cpu_delta: np.ndarray,
+            mem_delta: np.ndarray,
+            vnf_delta: np.ndarray,
+            links_used: List[int],
+            state: Dict,
+            bw_req: float
+    ) -> bool:
+        """
+        资源可行性检查（修复版：基于剩余容量模型）
+        逻辑：如果 (需求 > 剩余容量)，则拒绝。
+        """
 
+        # 1. CPU 检查
+        # state['cpu'] 是剩余容量。如果 增量 > 剩余 + 误差，则不可行。
+        # 注意：这里假设 state['cpu'] 已经是 float64
+        rem_cpu = state.get('cpu')
+        if rem_cpu is not None:
+            if np.any(cpu_delta > rem_cpu + 1e-7):
+                # failure_indices = np.where(cpu_delta > rem_cpu + 1e-7)[0]
+                # logger.debug(f"CPU fail at nodes {failure_indices}")
+                return False
+
+        # 2. Memory 检查 (兼容 'mem' 和 'memory' 键名)
+        rem_mem = state.get('mem', state.get('memory'))
+        if rem_mem is not None:
+            if np.any(mem_delta > rem_mem + 1e-7):
+                return False
+
+        # 3. 带宽检查 (兼容 'bw' 和 'bandwidth' 键名)
+        rem_bw = state.get('bw', state.get('bandwidth'))
+        if rem_bw is not None and links_used:
+            # 带宽是标量需求，检查所有涉及的链路
+            unique_links = set(links_used)
+            for lid in unique_links:
+                idx = lid - 1
+                # 越界保护
+                if idx < 0 or idx >= len(rem_bw):
+                    continue
+
+                # 核心逻辑：如果 请求 > 剩余，则失败
+                if bw_req > rem_bw[idx] + 1e-7:
+                    # logger.debug(f"BW fail at link {lid}: req {bw_req} > rem {rem_bw[idx]}")
+                    return False
+
+        return True
+
+    def _construct_tree_with_order(self, request, network_state, dest_order):
+        """
+        Construct multicast tree following a given destination order.
+        Same logic as _construct_tree, only the dest order is controlled.
+        RETURN:
+            tree or None,
+            traj list,
+            failed_dest_indices
+        """
+        import copy
+
+        # =====================================================
+        # 1. Initialize tree
+        # =====================================================
+        tree_struct = self._init_tree_struct()
+        tree_struct['id'] = request['id']
+        tree_struct['nodes'].add(request['source'])
+        tree_struct['node_count'] = 1
+
+        traj = []
+        failed = []
+
+        # =====================================================
+        # 2. Follow forced destination order
+        # =====================================================
+        for d_idx in dest_order:
+            res, score, action, cost = self._calc_atnp(
+                tree_struct,
+                list(tree_struct['nodes']),
+                d_idx,
+                network_state,
+                tree_struct['nodes']
+            )
+
+            if not res['feasible']:
+                failed.append(d_idx)
+                continue
+
+            success = self._apply_path_to_tree(
+                tree_struct,
+                {'nodes': res['new_path_full'], 'hvt': res['hvt']},
+                request,
+                network_state,
+                real_deploy=False,
+                resource_delta=res['res_delta']
+            )
+
+            if not success:
+                failed.append(d_idx)
+                continue
+
+            tree_struct['added_dest_indices'].append(d_idx)
+
+            action_tuple = (0, 0, res.get('placement', {}))
+            traj.append((d_idx, action_tuple, res['res_delta']))
+
+        # =====================================================
+        # 3. Return result
+        # =====================================================
+        if failed:
+            return None, traj, failed
+
+        return tree_struct, traj, []
+
+    def _init_tree_struct(self) -> Dict:
+        """
+        Initialize an empty multicast tree structure.
+        Used by both normal construction and recall construction.
+        """
+        return {
+            'id': None,                      # will be filled later if needed
+            'tree': np.zeros(self.link_num),
+            'hvt': np.zeros((self.node_num, self.type_num)),
+            'paths_map': {},
+            'nodes': set(),                  # start empty; source added later
+            'added_dest_indices': [],
+            'traj': [],
+            'link_count': 0,
+            'node_count': 0
+        }
 
 if __name__ == "__main__":
     logger.info("Expert MSFCE module loaded (Optimized Version with Distance Matrix Cache)")

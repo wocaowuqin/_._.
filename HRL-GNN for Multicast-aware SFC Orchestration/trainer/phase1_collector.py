@@ -1,13 +1,10 @@
-# ================================================================
-# Phase 1 Expert Data Collector (FINAL)
-# Continuous Simulation + Request-level Expert
-# ================================================================
-
 import os
 import pickle
 import logging
 from tqdm import tqdm
 from typing import Dict, List, Any
+import numpy as np
+from torch_geometric.data import Data
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +19,6 @@ class Phase1ExpertCollector:
 
     Failure:
         - Expert cannot find feasible deployment
-        - Or resource exhausted during execution
     """
 
     def __init__(
@@ -53,112 +49,154 @@ class Phase1ExpertCollector:
             "fail": 0,
         }
 
+    # ------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------
     def _estimate_load(self) -> float:
         """
-        估算当前网络负载（用于 Phase2 区分轻载 / 重载）
-        返回值 ∈ [0, 1]
+        Rough network load estimation ∈ [0, 1]
         """
         rm = self.env.resource_mgr
 
-        # 带宽利用率
         bw_util = 1.0 - rm.B.mean() / max(1.0, rm.B_cap)
-
-        # CPU 利用率
         cpu_util = 1.0 - rm.C.mean() / max(1.0, rm.C_cap)
 
-        # 简单平均
         return 0.5 * bw_util + 0.5 * cpu_util
 
     # ------------------------------------------------------------
-    # Main entry (CONTINUOUS MODE)
+    # Main entry
     # ------------------------------------------------------------
     def collect(self):
-        logger.info("🚀 Starting Phase 1: Expert Data Collection (Continuous Mode)")
+        logger.info("🚀 Starting Phase 1: Expert Data Collection (GNN Mode)")
 
-        # 🔥 Only reset ONCE: empty network, start simulation
-        # 务必加上 options={'phase': 'phase1'}，否则它会去跑 Phase 3 的数据
+        # 1. 重置环境
         self.env.reset(options={'phase': 'phase1'})
 
-        pbar = tqdm(range(self.max_requests), desc="Collecting", ncols=120)
+        # 2. 获取数据源 (兼容 env 不同实现)
+        if hasattr(self.env, 'data_loader'):
+            events = self.env.data_loader.events
+            requests = self.env.data_loader.requests
+        else:
+            # 兼容旧接口
+            events = getattr(self.env, 'events', [])
+            requests = getattr(self.env, 'requests', [])
 
-        for idx in pbar:
-            # 🔥 Advance time & get next arriving request
-            req, state = self.env.reset_request()
+        if not requests:
+            logger.error("❌ No requests found! Please check env initialization.")
+            return
 
-            if req is None:
-                logger.info("✓ No more requests in dataset, stop Phase 1")
+        total_events = len(events)
+        pbar = tqdm(total=total_events, desc="Collecting", ncols=120)
+
+        for t, event in enumerate(events):
+            pbar.update(1)
+
+            # 兼容不同的键名 (arrive / arrive_event)
+            arrive_list = event.get("arrive", event.get("arrive_event", []))
+            leave_list = event.get("leave", event.get("leave_event", []))
+
+            # 处理离开
+            for leave_req_id in leave_list:
+                try:
+                    self.env.event_handler.unregister_service(leave_req_id)
+                except Exception:
+                    pass
+
+            # 处理到达
+            for req_id in arrive_list:
+                # ID 校验
+                if req_id <= 0 or req_id > len(requests):
+                    continue
+
+                req = requests[req_id - 1]
+                self.stats["requests"] += 1
+
+                # ========================================================
+                # 📸 [核心修复]：捕获当前的图状态 (Graph State)
+                # ========================================================
+                # 1. 手动同步环境状态，以便 get_graph_state 能读到正确数据
+                self.env.current_request = req
+                # 初始化临时树状态（专家决策前，树只包含源节点）
+                current_nodes = {req['source']}
+                current_tree = {
+                    'tree': np.zeros(self.env.resource_mgr.L),
+                    'hvt': np.zeros((self.env.resource_mgr.n, 8)),
+                    'links': []
+                }
+
+                # 2. 调用 ResourceManager 生成图特征
+                # 注意：这里直接调用 resource_mgr 的方法，绕过 env.get_state 的模式判断
+                x, edge_index, edge_attr, req_vec = self.env.resource_mgr.get_graph_state(
+                    current_request=req,
+                    nodes_on_tree=current_nodes,
+                    current_tree=current_tree,
+                    served_dest_count=0,
+                    sharing_strategy=0,
+                    nb_high_goals=10  # 假设高层目标数为10
+                )
+
+                # 3. 封装为 PyG Data 对象 (只保存 Tensor，节省空间)
+                # 必须 .cpu() 确保不占用 GPU 显存
+                state_to_save = Data(
+                    x=x.cpu(),
+                    edge_index=edge_index.cpu(),
+                    edge_attr=edge_attr.cpu(),
+                    req_vec=req_vec.cpu()
+                )
+                # ========================================================
+
+                # 获取网络状态字典供专家使用
+                network_state = self.env.resource_mgr.get_network_state_dict(req)
+
+                # 调用专家求解
+                expert_result = self.expert.solve_request_for_expert(req, network_state)
+
+                success = False
+                if expert_result is not None:
+                    tree, traj = expert_result
+                    if tree is not None:
+                        # 尝试部署
+                        if self.env.resource_mgr.apply_tree_deployment(req, tree):
+                            success = True
+                            self.stats["success"] += 1
+                            self.env.event_handler.register_service(req_id, tree)
+
+                            # ✅ [修复] 保存样本时，带上 "state"
+                            for (dest_idx, action, cost) in traj:
+                                self.success_samples.append({
+                                    "state": state_to_save,  # <--- 必须有这个！
+                                    "request": req,
+                                    "high_action": dest_idx,  # 统一命名
+                                    "dest_idx": dest_idx,
+                                    "action": action,
+                                    "cost": cost,
+                                    "load": self._estimate_load(),
+                                })
+
+                if not success:
+                    self.stats["fail"] += 1
+                    self.fail_contexts.append({
+                        "request": req,
+                        "network_state": network_state,
+                        "reason": "expert_failed"
+                    })
+
+                br = self.stats["fail"] / max(1, self.stats["requests"])
+                pbar.set_postfix(succ=self.stats["success"], fail=self.stats["fail"], BR=f"{br:.2%}")
+
+            # 提前结束
+            if self.stats["requests"] >= self.max_requests:
+                logger.info("✓ Reach max request limit")
                 break
 
-            self.stats["requests"] += 1
-            req_id = req.get("id", "unknown")
+            # 定期保存
+            if self.stats["requests"] > 0 and self.stats["requests"] % self.save_every == 0:
+                self._save_final()
 
-            # ----------------------------------------------------
-            # Expert solves under CURRENT residual resources
-            # ----------------------------------------------------
-            network_state = self.env.resource_mgr.get_network_state_dict(req)
-
-            expert_result = self.expert.solve_request_for_expert(
-                request=req,
-                network_state=network_state
-            )
-
-            success = False
-
-            if expert_result is not None:
-                tree, traj = expert_result
-
-                # Try to deploy on env (真实资源扣减)
-                # 使用 tree 专用接口，更稳健
-                ok = self.env.resource_mgr.apply_tree_deployment(req, tree)
-
-                if ok:
-                    success = True
-
-                    # register service for future leave
-                    self.env.event_handler.register_service(req_id, tree)
-
-                    for (dest_idx, action, cost) in traj:
-                        self.success_samples.append({
-                            "request": req,
-                            "dest_idx": dest_idx,
-                            "action": action,
-                            "cost": cost,
-                            # 可选：记录当时的负载，用于 Phase2 分流
-                            "load": self._estimate_load(),
-                        })
-
-            # ----------------------------------------------------
-            # Failure handling (BLOCKING)
-            # ----------------------------------------------------
-            if not success:
-                self.stats["fail"] += 1
-
-                # record fail context for Phase2
-                self.fail_contexts.append({
-                    "request": req,
-                    "network_state": network_state,
-                    "reason": "resource_blocking"
-                })
-            else:
-                self.stats["success"] += 1
-
-            # ----------------------------------------------------
-            # Logging & saving
-            # ----------------------------------------------------
-            if (idx + 1) % self.save_every == 0:
-                self._save_partial(idx + 1)
-
-            br = self.stats["fail"] / max(1, self.stats["requests"])
-            pbar.set_postfix(
-                succ=self.stats["success"],
-                fail=self.stats["fail"],
-                BR=f"{br:.2%}"
-            )
-
+        pbar.close()
         self._save_final()
         logger.info(f"✓ Phase 1 Done. Stats: {self.stats}")
         return self.stats
-
     # ------------------------------------------------------------
     # Saving
     # ------------------------------------------------------------

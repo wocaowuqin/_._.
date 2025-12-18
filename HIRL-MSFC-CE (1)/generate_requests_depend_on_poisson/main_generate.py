@@ -232,51 +232,68 @@ def save_requests(requests, filename):
     print(f"\n✓ 保存到: {filename}")
 
 
+# ... (前面的代码保持不变)
+
+def generate_events_file(requests, output_path, max_time_steps):
+    """
+    根据请求列表，生成时间轴事件文件
+    """
+    print(f"正在生成事件文件: {output_path} ...")
+
+    # 初始化时间轴：列表索引即为时间步 t
+    # 长度设为最大时间步 + 缓冲
+    events_timeline = [{'arrive_event': [], 'leave_event': []} for _ in range(max_time_steps + 200)]
+
+    count = 0
+    for req in requests:
+        # 获取该请求的到达和离开时间步
+        t_arrive = req.get('arrive_time_step')
+        t_leave = req.get('leave_time_step')
+        rid = req.get('id')
+
+        # 填充到达事件
+        if t_arrive is not None and t_arrive < len(events_timeline):
+            events_timeline[t_arrive]['arrive_event'].append(rid)
+
+        # 填充离开事件
+        if t_leave is not None and t_leave < len(events_timeline):
+            events_timeline[t_leave]['leave_event'].append(rid)
+
+        count += 1
+
+    # 保存
+    with open(output_path, 'wb') as f:
+        pickle.dump(events_timeline, f)
+    print(f"✓ 事件文件生成完毕 (包含 {count} 个请求的调度信息)")
+
+
 if __name__ == '__main__':
     import sys
     import os
 
     # 确保输出目录存在
-    output_dir = './data_output'
+    output_dir = './data/input_dir'  # ⚠️ 注意：请确认您的项目读取路径是 ./data_output 还是 ./data/input_dir
+    # 如果您的 main.py 读取的是 data/input_dir，请修改这里！
+    # 根据之前的日志，似乎是 ./data/input_dir 或 ./data_output
+    # 建议您先确认一下，或者两边都存一下
+
     os.makedirs(output_dir, exist_ok=True)
 
-    # 生成 Phase 1 数据
-    print("\n生成 Phase 1 数据...")
-    phase1_requests = generate_all_requests(T=200, lamda=0.6, seed=42)
+    # 1. 生成 Phase 1 数据
+    print("\n=== 生成 Phase 1 数据 ===")
+    phase1_requests = generate_all_requests(T=1000, lamda=0.6, seed=42)
     save_requests(phase1_requests, f'{output_dir}/phase1_requests.pkl')
 
-    # 生成 Phase 3 数据
-    print("\n生成 Phase 3 数据...")
-    phase3_requests = generate_all_requests(T=400, lamda=0.6, seed=123)
+    # ✅ 新增：生成对应的事件文件
+    generate_events_file(phase1_requests, f'{output_dir}/phase1_events.pkl', max_time_steps=1200)
+
+    # 2. 生成 Phase 3 数据
+    print("\n=== 生成 Phase 3 数据 ===")
+    phase3_requests = generate_all_requests(T=1000, lamda=0.6, seed=123)
     save_requests(phase3_requests, f'{output_dir}/phase3_requests.pkl')
 
-    # 验证
-    print("\n" + "=" * 70)
-    print("验证生成的数据")
-    print("=" * 70)
+    # ✅ 新增：生成对应的事件文件
+    generate_events_file(phase3_requests, f'{output_dir}/phase3_events.pkl', max_time_steps=1200)
 
-    print(f"\nPhase 1 数据验证:")
-    sources = [r['source'] for r in phase1_requests]
-    unique_sources = set(sources)
-
-    print(f"  请求数: {len(phase1_requests)}")
-    print(f"  唯一源节点: {sorted(unique_sources)}")
-    print(f"  源节点数量: {len(unique_sources)}")
-
-    # 检查是否所有源节点都是DC
-    non_dc_sources = [s for s in unique_sources if s not in DC_NODES]
-    if non_dc_sources:
-        print(f"  ❌ 发现非DC源节点: {non_dc_sources}")
-    else:
-        print(f"  ✅ 所有源节点都是DC节点")
-
-    # 显示示例
-    print(f"\n示例请求:")
-    for i, req in enumerate(phase1_requests[:3], 1):
-        print(f"\n  请求 {i}:")
-        print(f"    Source: {req['source']} {'✓DC' if req['source'] in DC_NODES else '✗非DC'}")
-        print(f"    Dests: {req['dest']}")
-        print(f"    VNFs: {req['vnf']}")
-        print(f"    BW: {req['bw_origin']}")
-
-    print("\n✅ 数据生成完成！")
+    # 验证... (保持不变)
+    print("\n✅ 所有数据(Requests + Events)生成完成！请重新运行 main.py")

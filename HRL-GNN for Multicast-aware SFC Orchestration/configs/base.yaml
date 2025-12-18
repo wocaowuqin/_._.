@@ -33,7 +33,7 @@ topology:
 capacities:
   cpu: 80.0
   memory: 60.0
-  bandwidth: 24.0
+  bandwidth: 80.0
 
 # 5. 环境参数
 environment:
