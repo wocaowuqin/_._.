@@ -633,3 +633,30 @@ class BackupPolicy:
         for reason, count in stats.get('failure_reasons', {}).items():
             print(f"  {reason}: {count}")
         print("=" * 50 + "\n")
+
+    # === 新增方法：适配 DAgger 接口 ===
+    def place_vnfs(self, request, network_state):
+        """
+        [DAgger Interface] 为 PolicyHelper 提供专家指导
+        当 RL Agent 询问专家意见时，我们调用 get_backup_plan 生成一个可行方案。
+        """
+        try:
+            # 1. 获取请求的目标节点列表
+            dests = request.get('dest', [])
+            if not dests:
+                return None
+
+            # 2. 策略：尝试为第一个目的地生成方案作为参考
+            # (BackupPolicy 的 get_backup_plan 本身就包含了 ResourceAware, ShortestPath 等策略)
+            # 注意：这里我们只取第0个目的地的方案作为"专家建议"
+            plan = self.get_backup_plan(0, network_state)
+
+            # 3. 如果方案可行，返回该方案
+            if plan and plan.get('feasible'):
+                return plan
+
+            return None
+        except Exception as e:
+            # 记录日志但不抛出异常，防止训练中断
+            # logger.debug(f"place_vnfs failed: {e}")
+            return None
