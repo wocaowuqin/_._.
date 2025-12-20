@@ -382,13 +382,22 @@ def main():
             traceback.print_exc()
             return
 
-        # 创建 Agent
+        # 🔥 修复：创建 Phase 2 Agent (明确指定 phase=2)
         try:
-            logger.info("🔧 初始化 Agent...")
-            agent = HRL_DQN_Agent(config)
+            logger.info("🔧 初始化 Phase 2 Agent...")
+            agent = HRL_DQN_Agent(config, phase=2)  # ✅ 关键修复
             logger.info("✅ Agent 初始化成功")
+            logger.info(f"   模式: Phase {agent.phase}")
             logger.info(f"   动作空间: {agent.n_actions}")
             logger.info(f"   设备: {agent.device}")
+
+            # 验证 Agent 结构
+            if hasattr(agent, 'policy_net'):
+                logger.info("   ✅ policy_net 已加载")
+            else:
+                logger.error("   ❌ policy_net 未找到，Agent 初始化可能有问题")
+                return
+
         except Exception as e:
             logger.error(f"❌ Agent 初始化失败: {e}")
             import traceback
@@ -408,13 +417,22 @@ def main():
         phase2_config = config.get('phase2', {})
         output_dir = get_config_path(config, 'ckpt_dir')
 
-        trainer = Phase2ILTrainer(
-            agent=agent,
-            expert_data_path=data_path,
-            output_dir=output_dir,
-            config=phase2_config
-        )
+        # 创建 Trainer
+        try:
+            trainer = Phase2ILTrainer(
+                agent=agent,
+                expert_data_path=data_path,
+                output_dir=output_dir,
+                config=phase2_config
+            )
+            logger.info("✅ Phase2 Trainer 初始化成功")
+        except Exception as e:
+            logger.error(f"❌ Trainer 初始化失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return
 
+        # 开始训练
         try:
             trainer.run()
             logger.info("✅ Phase 2 完成")
@@ -422,7 +440,6 @@ def main():
             logger.error(f"❌ Phase 2 执行失败: {e}")
             import traceback
             traceback.print_exc()
-
     # ==========================================
     # Phase 3: 强化学习微调
     # ==========================================
@@ -445,16 +462,28 @@ def main():
         # 创建 Agent
         try:
             logger.info("🔧 初始化 Agent...")
-            agent = HRL_DQN_Agent(config)
+
+            # 🔥 修正前：agent = HRL_DQN_Agent(config)
+
+            # 🔥 修正后：显式传入环境的真实维度
+            # 确保 Agent 内部使用 28 而不是 100 初始化网络
+            agent = HRL_DQN_Agent(
+                config,
+                high_action_dim=env.NB_HIGH_LEVEL_GOALS,  # 10
+                low_action_dim=env.NB_LOW_LEVEL_ACTIONS,  # 28 (self.n)
+                state_dim=env.observation_space['x'].shape[1] if hasattr(env, 'observation_space') else None
+                # 可选，视Agent实现而定
+            )
+
             logger.info("✅ Agent 初始化成功")
-            logger.info(f"   动作空间: {agent.n_actions}")
+            logger.info(f"   动作空间: High={env.NB_HIGH_LEVEL_GOALS}, Low={env.NB_LOW_LEVEL_ACTIONS}")
             logger.info(f"   设备: {agent.device}")
+
         except Exception as e:
             logger.error(f"❌ Agent 初始化失败: {e}")
             import traceback
             traceback.print_exc()
             return
-
         # 加载预训练模型（可选）
         ckpt_dir = get_config_path(config, 'ckpt_dir')
         pretrained_path = os.path.join(ckpt_dir, "il_model_final.pth")

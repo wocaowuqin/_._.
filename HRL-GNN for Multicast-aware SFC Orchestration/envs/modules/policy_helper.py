@@ -12,7 +12,7 @@ from .sfc_backup_system.backup_policy import BackupPolicy
 # Expert Import
 # ==========================================================
 try:
-    from core.expert.expert_msfce import MSFCE_Solver
+    from core.expert.expert_msfce.core.solver import MSFCE_Solver
 except ImportError:
     try:
         from expert_msfce import MSFCE_Solver
@@ -22,7 +22,7 @@ except ImportError:
         project_root = current_file.parents[3]
         sys.path.append(str(project_root))
         try:
-            from core.expert.expert_msfce import MSFCE_Solver
+            from core.expert.expert_msfce.core.solver import MSFCE_Solverf
         except ImportError:
             # 占位符防止 IDE 报错
             class MSFCE_Solver:

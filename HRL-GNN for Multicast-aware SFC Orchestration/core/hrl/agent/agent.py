@@ -1,9 +1,9 @@
 """
 core/hrl/agent.py - Unified HRL Agent
-修复:
-1. ✅ __init__ 增加 phase 参数并保存 self.phase (解决 AttributeError)
-2. ✅ select_action 包含最新的逻辑分支
-3. ✅ 底部 create_agent_from_config 同步更新
+修复记录:
+1. ✅ load() 方法增加对 Phase 2 模型 (policy_net) 的兼容支持
+2. ✅ __init__ 接收 kwargs，防止 TypeError
+3. ✅ 优先使用环境传入的维度，防止 Invalid Action
 """
 
 import torch
@@ -40,7 +40,6 @@ class QNetworkWrapper(nn.Module):
 
         # 2. 自动探测维度
         encoder_output_dim = self._probe_encoder_dim()
-        # logger.info(f"[QNetworkWrapper] Encoder Output Dim: {encoder_output_dim}")
 
         # 3. High-level Q-head
         self.q_high = nn.Sequential(
@@ -97,20 +96,31 @@ class HRL_DQN_Agent:
     分层强化学习智能体
     """
 
-    def __init__(self, config, phase=3):
+    def __init__(self, config, phase=3, **kwargs):
         """
         初始化 Agent
-        🚨【关键修复】必须接收 phase 参数并保存到 self.phase
+        ✅ kwargs 接收 'high_action_dim', 'low_action_dim' 等参数
         """
         self.cfg = config
-        self.phase = int(phase)  # ✅ 保存 phase 属性
+        self.phase = int(phase)
         self.device = torch.device(config['eval']['device'])
 
-        # 动作空间
-        env_cfg = config.get('env', {})
-        self.n_actions = env_cfg.get('nb_low_level_actions', 50)
-        self.n_goals = env_cfg.get('nb_high_level_goals', 10)
+        # 🔥【关键修复】确定动作空间
+        env_cfg = config.get('environment', config.get('env', {}))
 
+        # Low Action Dim
+        if 'low_action_dim' in kwargs:
+            self.n_actions = int(kwargs['low_action_dim'])
+        else:
+            self.n_actions = env_cfg.get('nb_low_level_actions', 50)
+
+        # High Action Dim
+        if 'high_action_dim' in kwargs:
+            self.n_goals = int(kwargs['high_action_dim'])
+        else:
+            self.n_goals = env_cfg.get('nb_high_level_goals', 10)
+
+        logger.info(f"🔧 [Agent] Action Space: High={self.n_goals}, Low={self.n_actions}")
         logger.info(f"Initializing HRL Agent for Phase {self.phase}...")
 
         if self.phase == 2:
@@ -140,7 +150,6 @@ class HRL_DQN_Agent:
         logger.info(f"✅ HRL_DQN_Agent Initialized (Phase {self.phase})")
 
     def __getattr__(self, name):
-        # 保护机制：防止 Phase 3 误用 policy_net
         if name == 'policy_net' and self.phase == 3:
             raise RuntimeError("❌ [Fatal Error] Phase 3 禁止调用 'policy_net'! 请检查代码逻辑。")
         raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
@@ -148,6 +157,7 @@ class HRL_DQN_Agent:
     def _init_phase2(self):
         """Phase 2 Init"""
         self.policy_net = HierarchicalPolicy(self.cfg).to(self.device)
+
         encoder_path = self.cfg.get('gnn', {}).get('encoder_path', "outputs/il_train/shared_encoder.pth")
         if encoder_path and os.path.exists(encoder_path):
             try:
@@ -175,23 +185,25 @@ class HRL_DQN_Agent:
         full_model_path = "outputs/checkpoints/il_model_final.pth"
 
         encoder = None
-        if os.path.exists(shared_enc_path):
+        # 1. 优先尝试从 IL 完整模型提取 Encoder
+        if os.path.exists(full_model_path):
+            try:
+                checkpoint = torch.load(full_model_path, map_location=self.device)
+                key = 'policy_net' if 'policy_net' in checkpoint else None
+                state_dict = checkpoint[key] if key else checkpoint
+                temp_model.load_state_dict(state_dict, strict=False)
+                encoder = temp_model.gnn.encoder
+                logger.info(f"[Phase3] Extracted Encoder from {full_model_path}")
+            except Exception as e:
+                logger.warning(f"[Phase3] Failed to extract from full model: {e}")
+
+        # 2. 其次尝试单独的 encoder
+        if encoder is None and os.path.exists(shared_enc_path):
             try:
                 state_dict = torch.load(shared_enc_path, map_location=self.device)
                 temp_model.gnn.encoder.load_state_dict(state_dict)
                 encoder = temp_model.gnn.encoder
                 logger.info(f"[Phase3] Loaded Shared Encoder from {shared_enc_path}")
-            except Exception:
-                pass
-
-        if encoder is None and os.path.exists(full_model_path):
-            try:
-                checkpoint = torch.load(full_model_path, map_location=self.device)
-                key = 'policy_net' if 'policy_net' in checkpoint else None
-                state_dict = checkpoint[key] if key else checkpoint
-                temp_model.load_state_dict(state_dict)
-                encoder = temp_model.gnn.encoder
-                logger.info(f"[Phase3] Extracted Encoder from {full_model_path}")
             except Exception:
                 pass
 
@@ -261,7 +273,6 @@ class HRL_DQN_Agent:
 
         with torch.no_grad():
             if self.phase == 2:
-                # Phase 2: Policy Net (Logits)
                 outputs = self.policy_net(x, edge_index, edge_attr, req_vec, batch=batch)
                 if isinstance(outputs, tuple):
                     mid_logits, low_logits = outputs[:2]
@@ -278,7 +289,6 @@ class HRL_DQN_Agent:
                 low_act = int(low_logits.argmax(dim=1).item())
 
             else:
-                # Phase 3: Q-Network (Q-Values)
                 q_high = self.q_network.get_high_q_values(x, edge_index, edge_attr, req_vec, batch=batch)
 
                 t_high_mask = torch.tensor(high_mask, dtype=torch.float32, device=self.device)
@@ -300,11 +310,6 @@ class HRL_DQN_Agent:
 
     def store_transition(self, state, action, reward, next_state, done,
                          goal=None, next_valid_mask=None):
-        if hasattr(state, 'x') and torch.is_tensor(state.x):
-            # 简单防护：如果是 PyG Data，尝试转回 dict 或者警告
-            # logger.warning("⚠️ [Data Risk] PyG Data detected in store()")
-            pass
-
         transition = {
             'state': state,
             'action': action,
@@ -423,7 +428,7 @@ class HRL_DQN_Agent:
                 next_state_batch.req_vec, next_high_actions_onehot, next_state_batch.batch
             )
             next_low_actions = next_q_low_online.argmax(dim=1, keepdim=True)
-            q_low_target = next_q_low_online.gather(1, next_low_actions)  # Double DQN fix
+            q_low_target = next_q_low_online.gather(1, next_low_actions)
             q_low_target = rewards + self.gamma * q_low_target * (1 - dones)
 
         low_loss = F.smooth_l1_loss(q_low_selected, q_low_target)
@@ -469,19 +474,52 @@ class HRL_DQN_Agent:
         logger.info(f"💾 Model saved to: {path}")
 
     def load(self, path):
+        """
+        🔥 修复：智能加载方法 (支持从 IL 迁移到 RL)
+        """
+        logger.info(f"🔍 Loading model from {path} (Phase {self.phase})")
         checkpoint = torch.load(path, map_location=self.device)
+
         self.phase = checkpoint.get('phase', self.phase)
-
-        if self.phase == 2:
-            self.policy_net.load_state_dict(checkpoint['policy_net'])
-        else:
-            self.q_network.load_state_dict(checkpoint['q_network'])
-            self.target_q_network.load_state_dict(checkpoint['q_network'])
-
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.epsilon = checkpoint.get('epsilon', self.epsilon)
         self.steps_done = checkpoint.get('steps_done', self.steps_done)
-        logger.info(f"📥 Model loaded: {path}")
+
+        # 核心逻辑
+        if self.phase == 2:
+            if 'policy_net' in checkpoint:
+                self.policy_net.load_state_dict(checkpoint['policy_net'])
+                logger.info("✅ Phase 2 model loaded successfully.")
+            else:
+                logger.error("❌ Checkpoint invalid for Phase 2 (missing 'policy_net')")
+
+        else:
+            # Phase 3 模式：兼容两种情况
+            if 'q_network' in checkpoint:
+                # 情况 A: 加载 RL 训练过的模型
+                self.q_network.load_state_dict(checkpoint['q_network'])
+                self.target_q_network.load_state_dict(checkpoint['q_network'])
+                if 'optimizer' in checkpoint:
+                    self.optimizer.load_state_dict(checkpoint['optimizer'])
+                logger.info("✅ Phase 3 RL model loaded (Full Resume).")
+
+            elif 'policy_net' in checkpoint:
+                # 情况 B: 加载 IL 预训练模型 (Transfer Learning)
+                logger.info("⚠️ Detected IL Model (policy_net). Extracting Encoder for RL...")
+
+                # 1. 临时实例化一个 Policy Net
+                temp_policy = HierarchicalPolicy(self.cfg).to(self.device)
+                temp_policy.load_state_dict(checkpoint['policy_net'])
+
+                # 2. 提取 Encoder 权重
+                encoder_state = temp_policy.gnn.encoder.state_dict()
+
+                # 3. 注入到 Q-Network 的 Encoder
+                self.q_network.encoder.load_state_dict(encoder_state)
+                self.target_q_network.encoder.load_state_dict(encoder_state)
+
+                logger.info("✅ Encoder transferred from IL to RL Agent.")
+            else:
+                logger.warning("❌ Unknown checkpoint format. No weights loaded.")
 
 
 def create_agent_from_config(config, phase=3):

@@ -1,34 +1,40 @@
-class EventHandler:
-    """事件处理器：处理请求离开与资源回收"""
+"""
+envs/modules/event_handler.py
+✅ 修复: 添加 self.services 属性，防止 AttributeError
+"""
+import logging
 
+logger = logging.getLogger(__name__)
+
+
+class EventHandler:
     def __init__(self, resource_manager):
         self.resource_mgr = resource_manager
-        # 记录正在服务的请求状态: req_id -> {paths: [], vnfs: [(node, cpu, mem)]}
-        self.active_services = {}
+        # 🔥【关键修复】必须初始化 services 字典
+        self.services = {}
 
-    def register_service(self, req_id: int, deploy_info: dict):
-        """注册已部署的服务 (用于后续回收)"""
-        # deploy_info 结构需包含占用的路径和节点资源
-        self.active_services[req_id] = deploy_info
+    def register_service(self, req_id, deployment_info):
+        """注册已部署的服务 (用于后续释放)"""
+        self.services[req_id] = deployment_info
 
-    def process_leaves(self, leave_ids: list):
-        """处理离开事件，回收资源"""
-        for rid in leave_ids:
-            if rid in self.active_services:
-                info = self.active_services.pop(rid)
-                self._release_resources(info)
+    def unregister_service(self, req_id):
+        """注销服务并释放资源"""
+        if req_id in self.services:
+            service = self.services.pop(req_id)
+            req = service.get('req')
+            tree = service.get('tree')
 
-    def _release_resources(self, info: dict):
-        """释放具体资源"""
-        # 释放路径带宽
-        for path in info.get('paths', []):
-            bw = info.get('bw', 0.0)
-            self.resource_mgr.release_link_resource(path, bw)
+            if req and tree:
+                # 调用资源管理器释放资源
+                self.resource_mgr.release_resources_from_req(req, tree)
+            return True
+        return False
 
-        # 释放VNF计算资源
-        for vnf in info.get('vnfs', []):
-            node_id, cpu, mem = vnf
-            self.resource_mgr.release_node_resource(node_id, cpu, mem)
+    def process_leaves(self, leave_list):
+        """批量处理离开事件"""
+        for req_id in leave_list:
+            self.unregister_service(req_id)
 
     def reset(self):
-        self.active_services.clear()
+        """重置状态"""
+        self.services.clear()

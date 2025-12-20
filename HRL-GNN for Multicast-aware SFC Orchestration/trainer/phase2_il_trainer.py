@@ -43,7 +43,23 @@ class Phase2ILTrainer:
         if not self.output_dir.exists():
             self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.device = next(self.agent.policy_net.parameters()).device
+        # 🔥 修复：兼容 Phase 2 和 Phase 3 的 Agent 结构
+        if hasattr(agent, 'policy_net'):
+            # Phase 2 Agent (正确)
+            self.model = agent.policy_net
+            self.optimizer = agent.optimizer
+            logger.info("✅ 使用 Phase 2 Agent (policy_net)")
+        elif hasattr(agent, 'q_network'):
+            # Phase 3 Agent (警告但兼容)
+            logger.warning("⚠️ Phase 2 检测到 Phase 3 Agent 结构，请检查初始化逻辑")
+            self.model = agent.q_network
+            self.optimizer = agent.optimizer
+        else:
+            raise RuntimeError("❌ Agent 缺少 policy_net 或 q_network 属性")
+
+        # 🔥 修复：从 self.model 获取 device
+        self.device = next(self.model.parameters()).device
+
         self.batch_size = config.get("batch_size", 32)
         self.request_dim = config.get("request_feat_dim", 24)
         self.epochs = config.get("epochs", 10)
@@ -67,10 +83,10 @@ class Phase2ILTrainer:
         else:
             raise ValueError("Unknown data format")
 
-        print(f"[Phase2] Loaded {len(self.expert_data)} expert samples")
+        logger.info(f"[Phase2] Loaded {len(self.expert_data)} expert samples")
 
         if len(self.expert_data) == 0:
-            print("❌ Error: No samples loaded!")
+            logger.warning("❌ Error: No samples loaded!")
             self.dataloader = []
         else:
             self.dataloader = DataLoader(
@@ -79,7 +95,6 @@ class Phase2ILTrainer:
                 shuffle=True,
                 collate_fn=self._collate_fn
             )
-
     def _collate_fn(self, batch):
         states = []
         actions = []
@@ -164,34 +179,31 @@ class Phase2ILTrainer:
 
         return self.criterion(logits, target_actions)
 
-    def _save_model(self, filename: str):
-        """保存模型"""
-        import logging
-        logger = logging.getLogger(__name__)
-
-        save_dir = self.output_dir
-        os.makedirs(save_dir, exist_ok=True)
+    def save_checkpoint(self, epoch: int, loss: float):
+        """保存模型检查点"""
+        checkpoint = {
+            'epoch': epoch,
+            'policy_net': self.model.state_dict(),  # ✅ 包装在 'policy_net' 键下
+            'optimizer': self.optimizer.state_dict(),
+            'loss': loss,
+            'config': self.cfg
+        }
 
         # 保存完整模型
-        full_path = os.path.join(save_dir, filename)
-        torch.save(self.agent.policy_net.state_dict(), full_path)
-        logger.info(f"[Phase2] Full IL model saved to {full_path}")
+        ckpt_path = self.output_dir / f"il_model_epoch_{epoch}.pth"
+        torch.save(checkpoint, ckpt_path)
 
-        # 🔥 修复：检查是否有encoder属性，如果没有就保存GNN部分
-        try:
-            # 尝试保存encoder（如果存在）
-            encoder_path = os.path.join(save_dir, "il_model_encoder.pth")
-            if hasattr(self.agent.policy_net, 'encoder'):
-                torch.save(self.agent.policy_net.encoder.state_dict(), encoder_path)
-                logger.info(f"[Phase2] Encoder saved to {encoder_path}")
-            elif hasattr(self.agent.policy_net, 'gnn'):
-                # 保存GNN部分
-                torch.save(self.agent.policy_net.gnn.state_dict(), encoder_path)
-                logger.info(f"[Phase2] GNN saved to {encoder_path}")
-            else:
-                # 如果没有明确的encoder或gnn，保存整个模型
-                torch.save(self.agent.policy_net.state_dict(), encoder_path)
-                logger.info(f"[Phase2] Full model saved as encoder to {encoder_path}")
-        except AttributeError as e:
-            logger.warning(f"无法保存encoder: {e}")
+        # 保存最终模型（Phase 3 加载用）
+        final_path = self.output_dir / "il_model_final.pth"
+        torch.save(checkpoint, final_path)  # ✅ 同样包装
 
+        # 保存纯 Encoder（可选）
+        encoder_dict = {
+            k: v for k, v in self.model.state_dict().items()
+            if 'gnn.encoder' in k
+        }
+        encoder_path = self.output_dir / "il_model_encoder.pth"
+        torch.save(encoder_dict, encoder_path)
+
+        logger.info(f"✅ Checkpoint saved: {ckpt_path}")
+        logger.info(f"✅ Final model saved: {final_path}")
