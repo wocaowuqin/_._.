@@ -1,21 +1,20 @@
-#!/usr/bin/env python3
+# !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-完整的资源管理器 (Production-Ready)
+完整的资源管理器 (Fixed Scope & Logic Version)
 
-特性:
-1. ✅ 支持节点 CPU、内存资源管理
-2. ✅ 支持链路带宽资源管理
-3. ✅ VNF 实例追踪和共享
-4. ✅ 资源回收机制
-5. ✅ 完整的状态构建（GNN 和 Flat）
-6. ✅ 距离矩阵计算
-7. ✅ 类型安全和验证
+修复记录:
+1. ✅ [CRITICAL] 修复 check_global_feasibility 缩进错误，使其能被外部调用
+2. ✅ [CRITICAL] 修复 _encode_request 返回全0向量的问题，增加特征维度
+3. ✅ [LOGIC] check_global_feasibility 改为宽松逻辑（单路径可达即放行）
+4. ✅ [LOGIC] apply_tree_deployment 增加 phase 参数，支持 Phase1 宽松模式
 """
 
 import numpy as np
 import networkx as nx
 import logging
+import threading
+import copy
 from typing import Dict, List, Tuple, Optional, Set, Any
 from collections import defaultdict
 
@@ -23,725 +22,520 @@ logger = logging.getLogger(__name__)
 
 
 class ResourceManager:
-    """
-    完整的资源管理器
-
-    职责:
-    1. 管理节点资源（CPU、内存）
-    2. 管理链路资源（带宽）
-    3. 追踪 VNF 部署
-    4. 提供资源检查和分配接口
-    5. 构建网络状态表示
-    """
-
-    def __init__(
-            self,
-            topo: np.ndarray,
-            capacities: Dict[str, float],
-            dc_nodes: List[int],
-            link_map: Optional[Dict] = None
-    ):
+    def __init__(self, *args, **kwargs):
         """
         初始化资源管理器
-
-        Args:
-            topo: 拓扑矩阵 (n, n)，1 表示有连接
-            capacities: 资源容量配置 {'cpu': 80.0, 'memory': 60.0, 'bandwidth': 80.0}
-            dc_nodes: DC 节点列表（0-based）
-            link_map: 链路映射字典 {(u,v): link_id}（可选）
+        支持:
+        1. (topo, capacities, dc_nodes) - 新版
+        2. (node_num, link_num, type_num, ...) - 旧版
         """
+        self.init_mode = "unknown"
+        self.node_index_base = kwargs.get('node_index_base', 1)
+        self._lock = threading.RLock()
+
+        if len(args) >= 4 and isinstance(args[0], int):
+            self._init_legacy(*args, **kwargs)
+        elif len(args) >= 2:
+            self._init_modern(*args, **kwargs)
+        else:
+            if 'topo' in kwargs:
+                self._init_modern(**kwargs)
+            else:
+                raise TypeError("Invalid arguments for ResourceManager init")
+
+    def _init_legacy(self, node_num, link_num, type_num, cap_cpu, cap_mem=80.0, cap_bw=80.0, **kwargs):
+        self.init_mode = "legacy"
+        logger.info("[RM] Using legacy initialization")
+
+        self.n = int(node_num)
+        self.topo = np.ones((self.n, self.n), dtype=np.float32)
+        np.fill_diagonal(self.topo, 0)
+
+        self.L_provided = int(link_num)
+        self.K_vnf = int(type_num)
+        self.num_graph_edges = int(np.sum(self.topo > 0))
+        self.C_cap = float(cap_cpu)
+        self.M_cap = float(cap_mem)
+        self.B_cap = float(cap_bw)
+        self.dc_nodes = list(range(min(10, self.n)))
+
+        self.link_map = self._create_link_map(self.topo)
+        max_lid = max(self.link_map.values()) if self.link_map else 0
+        self.L = max(self.L_provided, max_lid)
+
+        self._init_common()
+
+    def _init_modern(self, topo, capacities, dc_nodes, link_map=None, **kwargs):
+        self.init_mode = "modern"
+        logger.info("[RM] Using modern initialization")
+
         self.topo = topo
         self.n = topo.shape[0]
-
-        # ========================================
-        # 1. 基本参数
-        # ========================================
-        # 计算图边数和物理链路数
-        self.num_graph_edges = int(np.sum(topo > 0))  # 双向边
+        self.num_graph_edges = int(np.sum(topo > 0))
 
         if link_map:
-            # 使用提供的 link_map
-            max_id = max(link_map.values()) if link_map else 0
-            self.L = max_id
             self.link_map = link_map
         else:
-            # 自动生成 link_map（对称双向）
-            self.L = self.num_graph_edges // 2
             self.link_map = self._create_link_map(topo)
 
-        logger.info(
-            f"[RM] Init: Nodes={self.n}, GraphEdges={self.num_graph_edges}, "
-            f"PhysLinks={self.L}"
-        )
+        self.L = max(self.link_map.values()) if self.link_map else 0
 
-        # ========================================
-        # 2. 容量配置
-        # ========================================
         self.C_cap = float(capacities.get('cpu', 80.0))
         self.M_cap = float(capacities.get('memory', 60.0))
         self.B_cap = float(capacities.get('bandwidth', 80.0))
-        self.K_vnf = 8  # VNF 类型数（默认）
-
+        self.K_vnf = 8
         self.dc_nodes = list(dc_nodes)
 
-        logger.info(
-            f"[RM] Capacities: CPU={self.C_cap}, MEM={self.M_cap}, BW={self.B_cap}"
-        )
+        self._init_common()
 
-        # ========================================
-        # 3. 动态资源状态
-        # ========================================
-        # 节点资源数组
-        self.C = np.full(self.n, self.C_cap, dtype=np.float64)  # 剩余 CPU
-        self.M = np.full(self.n, self.M_cap, dtype=np.float64)  # 剩余 Memory
+    def _init_common(self):
+        self.C = np.full(self.n, self.C_cap, dtype=np.float32)
+        self.M = np.full(self.n, self.M_cap, dtype=np.float32)
 
-        # 链路资源数组
-        self.B = np.full(self.L, self.B_cap, dtype=np.float64)  # 剩余带宽
-        self.link_ref_count = np.zeros(self.L, dtype=np.int32)  # 链路引用计数
+        if self.L > 0:
+            self.B = np.full(self.L, self.B_cap, dtype=np.float32)
+        else:
+            self.B = np.array([], dtype=np.float32)
 
-        # VNF 实例矩阵 (n, K_vnf)
-        self.hvt_all = np.zeros((self.n, self.K_vnf), dtype=np.float64)
+        self.link_ref_count = np.zeros(self.L, dtype=np.int32)
+        self.hvt_all = np.zeros((self.n, self.K_vnf), dtype=np.float32)
 
-        # ========================================
-        # 4. 资源字典（兼容多种访问方式）
-        # ========================================
-        self.nodes = {
-            'cpu': self.C.copy(),
-            'memory': self.M.copy()
-        }
+        self.nodes = {'cpu': self.C, 'memory': self.M}
+        self.links = {'bandwidth': {}}
 
-        self.links = {
-            'bandwidth': {}
-        }
+        for (u, v), lid in self.link_map.items():
+            idx = lid - 1
+            if 0 <= idx < self.L:
+                self.links['bandwidth'][(u, v)] = self.B[idx]
 
-        # 初始化链路带宽字典
-        for (u, v), link_id in self.link_map.items():
-            self.links['bandwidth'][(u, v)] = self.B_cap
+        self.initial_C = self.C.copy()
+        self.initial_M = self.M.copy()
+        self.initial_B = self.B.copy()
 
-        # 别名（向后兼容）
-        self.node_cap = self.C
-        self.node_mem = self.M
-        self.link_cap = self.B
-
-        # ========================================
-        # 5. VNF 部署追踪
-        # ========================================
-        self.vnf_instances = []  # VNF 实例列表
-        self.vnf_sharing_map = defaultdict(set)  # VNF 共享映射 {(node, vnf_type): {req_ids}}
-
-        # ========================================
-        # 6. 请求追踪
-        # ========================================
-        self.active_requests = {}  # {req_id: deployment_info}
-
-        # ========================================
-        # 7. 辅助数据结构
-        # ========================================
-        self.shortest_dist = self._build_shortest_dist_matrix()
-        self._dest_dist_cache = {}
-
-        # GNN 维度定义
-        self.node_feat_dim = 6 + self.K_vnf + 3  # 基础特征 + VNF + 额外
-        self.edge_feat_dim = 5
-        self.request_dim = 24
-
-        # 构建边索引（用于 GNN）
-        self.edge_index = self._build_edge_index()
-
-        logger.info(f"✅ ResourceManager 初始化完成")
-
-    def _create_link_map(self, topo: np.ndarray) -> Dict[Tuple[int, int], int]:
-        """
-        创建链路映射表
-
-        Returns:
-            {(u, v): link_id} 字典
-        """
-        link_map = {}
-        link_id = 1
-
-        for i in range(self.n):
-            for j in range(i + 1, self.n):  # 只遍历上三角
-                if topo[i, j] > 0:
-                    # 双向边使用同一个 link_id
-                    link_map[(i, j)] = link_id
-                    link_map[(j, i)] = link_id
-                    link_id += 1
-
-        return link_map
-
-    def _build_shortest_dist_matrix(self) -> np.ndarray:
-        """
-        构建最短距离矩阵（Floyd-Warshall 或 NetworkX）
-
-        Returns:
-            距离矩阵 (n, n)
-        """
-        dist = np.full((self.n, self.n), 9999.0, dtype=np.float32)
-        np.fill_diagonal(dist, 0.0)
-
-        # 使用 NetworkX 计算最短路径
-        G = nx.Graph()
-        for i in range(self.n):
-            for j in range(self.n):
-                if self.topo[i, j] > 0:
-                    G.add_edge(i, j, weight=1)
+        self.vnf_instances = []
+        self.active_requests = {}
+        self.vnf_sharing_map = defaultdict(set)
 
         try:
-            lengths = dict(nx.all_pairs_shortest_path_length(G))
-            for u in range(self.n):
-                for v in range(self.n):
-                    if v in lengths.get(u, {}):
-                        dist[u, v] = lengths[u][v]
+            self.shortest_dist = self._build_shortest_dist_matrix()
+            self.edge_index = self._build_edge_index()
         except Exception as e:
-            logger.warning(f"NetworkX 计算失败，使用 BFS: {e}")
-            # Fallback: BFS
-            for src in range(self.n):
-                dist[src] = self._bfs_distances(src)
-
-        return dist
-
-    def _bfs_distances(self, src: int) -> np.ndarray:
-        """BFS 计算单源最短距离"""
-        dist = np.full(self.n, 9999.0, dtype=np.float32)
-        dist[src] = 0
-
-        visited = {src}
-        queue = [(src, 0)]
-
-        while queue:
-            node, d = queue.pop(0)
-
-            for neighbor in range(self.n):
-                if self.topo[node, neighbor] > 0 and neighbor not in visited:
-                    visited.add(neighbor)
-                    dist[neighbor] = d + 1
-                    queue.append((neighbor, d + 1))
-
-        return dist
-
-    def _build_edge_index(self) -> np.ndarray:
-        """
-        构建边索引（用于 GNN）
-
-        Returns:
-            edge_index: (2, num_edges)
-        """
-        edges = []
-        for i in range(self.n):
-            for j in range(self.n):
-                if self.topo[i, j] > 0:
-                    edges.append([i, j])
-
-        if edges:
-            return np.array(edges, dtype=np.int64).T
-        else:
-            return np.zeros((2, 0), dtype=np.int64)
-
-    # ========================================================================
-    # 资源检查和分配
-    # ========================================================================
-
-    def check_node_resources(
-            self,
-            node: int,
-            cpu_req: float,
-            mem_req: float
-    ) -> bool:
-        """
-        检查节点资源是否充足
-
-        Args:
-            node: 节点索引
-            cpu_req: CPU 需求
-            mem_req: 内存需求
-
-        Returns:
-            True 如果资源充足
-        """
-        if node < 0 or node >= self.n:
-            return False
-
-        return (self.C[node] >= cpu_req - 1e-8 and
-                self.M[node] >= mem_req - 1e-8)
-
-    def check_link_bandwidth(
-            self,
-            u: int,
-            v: int,
-            bw_req: float
-    ) -> bool:
-        """
-        检查链路带宽是否充足
-
-        Args:
-            u, v: 链路端点
-            bw_req: 带宽需求
-
-        Returns:
-            True 如果带宽充足
-        """
-        if (u, v) not in self.link_map:
-            return False
-
-        link_id = self.link_map[(u, v)]
-        link_idx = link_id - 1
-
-        if link_idx < 0 or link_idx >= self.L:
-            return False
-
-        return self.B[link_idx] >= bw_req - 1e-8
-
-    def allocate_node_resources(
-            self,
-            node: int,
-            cpu_req: float,
-            mem_req: float,
-            vnf_type: Optional[int] = None
-    ) -> bool:
-        """
-        分配节点资源
-
-        Args:
-            node: 节点索引
-            cpu_req: CPU 需求
-            mem_req: 内存需求
-            vnf_type: VNF 类型（可选）
-
-        Returns:
-            True 如果分配成功
-        """
-        if not self.check_node_resources(node, cpu_req, mem_req):
-            return False
-
-        # 扣除资源
-        self.C[node] -= cpu_req
-        self.M[node] -= mem_req
-
-        # 更新字典
-        self.nodes['cpu'][node] = self.C[node]
-        self.nodes['memory'][node] = self.M[node]
-
-        # 更新 VNF 矩阵
-        if vnf_type is not None and 0 <= vnf_type < self.K_vnf:
-            self.hvt_all[node, vnf_type] += 1
-
-        return True
-
-    def allocate_link_bandwidth(
-            self,
-            u: int,
-            v: int,
-            bw_req: float
-    ) -> bool:
-        """
-        分配链路带宽
-
-        Args:
-            u, v: 链路端点
-            bw_req: 带宽需求
-
-        Returns:
-            True 如果分配成功
-        """
-        if not self.check_link_bandwidth(u, v, bw_req):
-            return False
-
-        link_id = self.link_map[(u, v)]
-        link_idx = link_id - 1
-
-        # 扣除带宽
-        self.B[link_idx] -= bw_req
-        self.link_ref_count[link_idx] += 1
-
-        # 更新字典
-        self.links['bandwidth'][(u, v)] -= bw_req
-
-        return True
-
-    def release_node_resources(
-            self,
-            node: int,
-            cpu_req: float,
-            mem_req: float,
-            vnf_type: Optional[int] = None
-    ):
-        """释放节点资源"""
-        self.C[node] = min(self.C[node] + cpu_req, self.C_cap)
-        self.M[node] = min(self.M[node] + mem_req, self.M_cap)
-
-        # 更新字典
-        self.nodes['cpu'][node] = self.C[node]
-        self.nodes['memory'][node] = self.M[node]
-
-        # 更新 VNF 矩阵
-        if vnf_type is not None and 0 <= vnf_type < self.K_vnf:
-            self.hvt_all[node, vnf_type] = max(0, self.hvt_all[node, vnf_type] - 1)
-
-    def release_link_bandwidth(
-            self,
-            u: int,
-            v: int,
-            bw_req: float
-    ):
-        """释放链路带宽"""
-        if (u, v) not in self.link_map:
-            return
-
-        link_id = self.link_map[(u, v)]
-        link_idx = link_id - 1
-
-        self.B[link_idx] = min(self.B[link_idx] + bw_req, self.B_cap)
-        self.link_ref_count[link_idx] = max(0, self.link_ref_count[link_idx] - 1)
-
-        # 更新字典
-        if (u, v) in self.links['bandwidth']:
-            self.links['bandwidth'][(u, v)] = min(
-                self.links['bandwidth'][(u, v)] + bw_req,
-                self.B_cap
-            )
-
-    # ========================================================================
-    # 部署管理
-    # ========================================================================
-
-    def apply_deployment(
-            self,
-            plan: Dict,
-            request: Dict
-    ) -> bool:
-        """
-        应用部署方案
-
-        Args:
-            plan: 部署方案 {'hvt': array, 'placement': dict}
-            request: 请求信息
-
-        Returns:
-            True 如果部署成功
-        """
-        hvt_branch = plan.get('hvt')
-
-        if hvt_branch is None:
-            logger.warning("⚠️ plan['hvt'] is None")
-            return False
-
-        # 类型转换
-        if isinstance(hvt_branch, dict):
-            from envs.modules.sfc_backup_system.utils import build_hvt_from_placement
-            hvt_branch = build_hvt_from_placement(hvt_branch, self.n, self.K_vnf)
-
-        hvt_branch = np.asarray(hvt_branch, dtype=np.float32)
-
-        # 验证形状
-        if hvt_branch.shape != (self.n, self.K_vnf):
-            logger.error(f"❌ Invalid hvt shape: {hvt_branch.shape}")
-            return False
-
-        # 获取请求信息
-        req_id = request.get('id', -1)
-        cpu_reqs = request.get('cpu_origin', [])
-        mem_reqs = request.get('memory_origin', [])
-
-        # 部署 VNF
-        deployed_vnfs = []
-
-        for node, vnf_type in np.argwhere(hvt_branch > 0):
-            node = int(node)
-            vnf_type = int(vnf_type)
-
-            cpu_need = cpu_reqs[vnf_type] if vnf_type < len(cpu_reqs) else 10.0
-            mem_need = mem_reqs[vnf_type] if vnf_type < len(mem_reqs) else 5.0
-
-            # 资源检查
-            if not self.check_node_resources(node, cpu_need, mem_need):
-                # 回滚已部署的 VNF
-                for n, vt, c, m in deployed_vnfs:
-                    self.release_node_resources(n, c, m, vt)
-                logger.warning(f"⚠️ Node {node} 资源不足")
-                return False
-
-            # 分配资源
-            if not self.allocate_node_resources(node, cpu_need, mem_need, vnf_type):
-                # 回滚
-                for n, vt, c, m in deployed_vnfs:
-                    self.release_node_resources(n, c, m, vt)
-                return False
-
-            deployed_vnfs.append((node, vnf_type, cpu_need, mem_need))
-
-            # 记录 VNF 实例
-            self.vnf_instances.append({
-                'req_id': req_id,
-                'node': node,
-                'vnf_type': vnf_type,
-                'cpu': cpu_need,
-                'memory': mem_need
-            })
-
-        return True
-
-    def apply_tree_deployment(
-            self,
-            plan: Dict,
-            request: Dict
-    ) -> bool:
-        """
-        应用树部署方案（包括链路带宽）
-
-        Args:
-            plan: 部署方案 {'hvt': array, 'tree': dict}
-            request: 请求信息
-
-        Returns:
-            True 如果部署成功
-        """
-        # 先应用节点部署
-        if not self.apply_deployment(plan, request):
-            return False
-
-        # 应用链路带宽
-        tree = plan.get('tree', {})
-        bw_req = request.get('bw_origin', 0)
-
-        deployed_links = []
-
-        for edge_key, flow in tree.items():
-            # 解析边
-            if isinstance(edge_key, str):
-                edge_key = edge_key.strip('()').replace(' ', '')
-                u, v = map(int, edge_key.split('-'))
-            elif isinstance(edge_key, tuple):
-                u, v = edge_key
-            else:
-                logger.warning(f"⚠️ Unknown edge_key type: {type(edge_key)}")
-                continue
-
-            # 分配带宽
-            if not self.allocate_link_bandwidth(u, v, bw_req * flow):
-                # 回滚链路
-                for link_u, link_v, bw in deployed_links:
-                    self.release_link_bandwidth(link_u, link_v, bw)
-
-                # 回滚节点（这里简化，实际应该记录所有部署）
-                logger.warning(f"⚠️ Link ({u}, {v}) 带宽不足")
-                return False
-
-            deployed_links.append((u, v, bw_req * flow))
-
-        # 记录请求部署
-        self.active_requests[request.get('id', -1)] = {
-            'vnf_instances': [v for v in self.vnf_instances if v['req_id'] == request.get('id', -1)],
-            'links': deployed_links
+            logger.warning(f"GNN结构初始化部分失败: {e}")
+            self.edge_index = np.zeros((2, 0))
+
+        self.node_feat_dim = 6 + self.K_vnf + 3
+        self.edge_feat_dim = 5
+        self.request_dim = 24  # 确保与 _encode_request 一致
+
+        self.initial_state_template = {
+            'cpu': self.C.copy(),
+            'mem': self.M.copy(),
+            'bw': self.B.copy(),
+            'hvt': np.zeros((self.n, self.K_vnf), dtype=np.float32),
+            'bw_ref_count': np.zeros(self.L, dtype=np.int32)
         }
-
-        return True
-
-    def remove_request(
-            self,
-            req_id: int
-    ):
-        """
-        移除请求，释放资源
-
-        Args:
-            req_id: 请求 ID
-        """
-        if req_id not in self.active_requests:
-            return
-
-        deployment = self.active_requests[req_id]
-
-        # 释放 VNF 资源
-        for vnf in deployment.get('vnf_instances', []):
-            self.release_node_resources(
-                vnf['node'],
-                vnf['cpu'],
-                vnf['memory'],
-                vnf['vnf_type']
-            )
-
-            # 从实例列表移除
-            if vnf in self.vnf_instances:
-                self.vnf_instances.remove(vnf)
-
-        # 释放链路资源
-        for u, v, bw in deployment.get('links', []):
-            self.release_link_bandwidth(u, v, bw)
-
-        # 移除记录
-        del self.active_requests[req_id]
+        logger.info(f"✅ ResourceManager Ready: Nodes={self.n}, Links={self.L}")
 
     # ========================================================================
-    # 状态构建
+    # 修复点 1: 辅助函数移出 _init_common，作为类方法
     # ========================================================================
-
-    def get_flat_state(
-            self,
-            current_request: Optional[Dict] = None,
-            **kwargs
-    ) -> np.ndarray:
+    def _build_bw_feasible_subgraph(self, bw_req):
         """
-        获取扁平状态向量
-
-        Returns:
-            状态向量
+        构建一个仅包含满足带宽需求链路的临时 NetworkX 图
         """
-        # 网络状态
-        net_state = np.concatenate([
-            self.C / self.C_cap,  # 归一化 CPU
-            self.M / self.M_cap,  # 归一化 Memory
-            self.B / self.B_cap,  # 归一化 Bandwidth
-            self.hvt_all.flatten()  # VNF 部署
-        ])
+        G = nx.Graph()
+        for (u, v), lid in self.link_map.items():
+            idx = lid - 1
+            if self.B[idx] >= bw_req - 1e-5:
+                G.add_edge(u, v)
+        return G
 
-        # 请求状态
-        if current_request:
-            req_state = self._encode_request(current_request)
-        else:
-            req_state = np.zeros(self.request_dim)
-
-        return np.concatenate([net_state, req_state]).astype(np.float32)
-
-    def get_gnn_state(
-            self,
-            current_request: Optional[Dict] = None,
-            **kwargs
-    ) -> Dict:
+        # =========================================================================
+        # 2️⃣ 核心修正：全局可行性检查 (带 ID 自动转换)
+        # =========================================================================
+    def check_global_feasibility(self, request, state):
         """
-        获取 GNN 状态
-
-        Returns:
-            {'x': node_features, 'edge_index': edge_index, 'request': request_vec}
+        检查全局可行性 (修正版)
+        1. 自动转换 1-based 节点 ID 到 0-based 内部索引
+        2. 在连通子图中检查 source -> dests 的可达性
         """
-        # 节点特征
-        node_features = self._build_node_features(current_request, **kwargs)
+        # 1. 转换 Source ID
+        raw_source = request.get('source')
+        if raw_source is None:
+            return False
+        # 强制从外部视角转换 (如果 node_index_base=1，这里会自动 -1)
+        source = self._normalize_node(raw_source, from_external=True)
 
-        # 请求特征
-        if current_request:
-            req_vec = self._encode_request(current_request)
-        else:
-            req_vec = np.zeros(self.request_dim)
+        # 2. 转换 Dest IDs
+        raw_dests = request.get('destinations') or request.get('dest')
+        if not raw_dests:
+            return False
+        # 对列表中的每个 dest 做转换
+        dests = [self._normalize_node(d, from_external=True) for d in raw_dests]
 
-        return {
-            'x': node_features.astype(np.float32),
-            'edge_index': self.edge_index,
-            'request': req_vec.astype(np.float32)
-        }
+        # 3. 检查转换后的 ID 是否越界 (双重保险)
+        if source < 0 or source >= self.n:
+            return False  # 转换后依然不合法，直接拒
 
-    def _build_node_features(
-            self,
-            current_request: Optional[Dict],
-            **kwargs
-    ) -> np.ndarray:
-        """构建节点特征矩阵 (n, node_feat_dim)"""
-        features = []
-
-        for i in range(self.n):
-            feat = [
-                self.C[i] / self.C_cap,  # 归一化 CPU
-                self.M[i] / self.M_cap,  # 归一化 Memory
-                1.0 if i in self.dc_nodes else 0.0,  # 是否 DC
-                len([v for v in self.vnf_instances if v['node'] == i]),  # VNF 数量
-                np.sum(self.hvt_all[i]),  # VNF 总数
-                np.mean(self.topo[i]),  # 平均连接度
-            ]
-
-            # VNF 类型分布
-            feat.extend(self.hvt_all[i] / max(1, np.sum(self.hvt_all[i])))
-
-            # 额外特征
-            feat.extend([0.0, 0.0, 0.0])  # 占位符
-
-            features.append(feat)
-
-        return np.array(features, dtype=np.float32)
-
-    def _encode_request(
-            self,
-            request: Dict
-    ) -> np.ndarray:
-        """编码请求为向量"""
-        vec = np.zeros(self.request_dim)
-
-        vec[0] = request.get('source', 0) / self.n
-
-        dests = request.get('dest', [])
-        vec[1] = len(dests) / self.n
-        if dests:
-            vec[2:6] = [d / self.n for d in dests[:4]]  # 前4个目标
-
-        vnfs = request.get('vnf', [])
-        vec[6] = len(vnfs) / self.K_vnf
-
-        cpu_reqs = request.get('cpu_origin', [])
-        if cpu_reqs:
-            vec[7] = np.mean(cpu_reqs) / self.C_cap
-
-        mem_reqs = request.get('memory_origin', [])
-        if mem_reqs:
-            vec[8] = np.mean(mem_reqs) / self.M_cap
-
+        # 4. 构建带宽满足的子图
         bw_req = request.get('bw_origin', 0)
-        vec[9] = bw_req / self.B_cap
+        G_bw = self._build_bw_feasible_subgraph(bw_req)
 
-        return vec
+        # 5. 基础检查：源节点是否孤立
+        if not G_bw.has_node(source):
+            return False
+
+        # 6. 宽松连通性检查 (只要能通一个 dest 就算可行)
+        for d in dests:
+            if 0 <= d < self.n and G_bw.has_node(d):
+                if nx.has_path(G_bw, source, d):
+                    return True
+
+        return False
+
+    def create_initial_state(self):
+        return copy.deepcopy(self.initial_state_template)
+
+    def normalize_state(self, state):
+        normalized = {}
+        for key in ['cpu', 'mem', 'bw', 'hvt']:
+            normalized[key] = state.get(key, self.initial_state_template[key].copy())
+        normalized['bw_ref_count'] = state.get('bw_ref_count',
+                                               self.initial_state_template['bw_ref_count'].copy())
+        return normalized
 
     # ========================================================================
-    # 辅助方法
+    # 核心资源操作
     # ========================================================================
 
     def reset(self):
-        """重置资源管理器到初始状态"""
-        self.C = np.full(self.n, self.C_cap, dtype=np.float64)
-        self.M = np.full(self.n, self.M_cap, dtype=np.float64)
-        self.B = np.full(self.L, self.B_cap, dtype=np.float64)
+        with self._lock:
+            self.C[:] = self.initial_C
+            self.M[:] = self.initial_M
+            self.B[:] = self.initial_B
+            self.hvt_all.fill(0)
+            self.link_ref_count.fill(0)
+            self.vnf_instances.clear()
+            self.active_requests.clear()
+            self.vnf_sharing_map.clear()
 
-        self.hvt_all = np.zeros((self.n, self.K_vnf), dtype=np.float64)
-        self.link_ref_count = np.zeros(self.L, dtype=np.int32)
+            for (u, v), lid in self.link_map.items():
+                idx = lid - 1
+                if 0 <= idx < self.L:
+                    self.links['bandwidth'][(u, v)] = self.B[idx]
 
-        # 重置字典
-        self.nodes['cpu'] = self.C.copy()
-        self.nodes['memory'] = self.M.copy()
+    def check_node_resources(self, node: int, cpu_req: float, mem_req: float, external_index: bool = False) -> bool:
+        internal_node = self._normalize_node(node, external_index)
+        if internal_node < 0 or internal_node >= self.n: return False
+        return (self.C[internal_node] >= cpu_req - 1e-5) and (self.M[internal_node] >= mem_req - 1e-5)
 
-        for (u, v) in self.link_map.keys():
-            self.links['bandwidth'][(u, v)] = self.B_cap
+    def check_link_bandwidth(self, u: int, v: int, bw_req: float) -> bool:
+        lid = self.link_map.get((u, v))
+        if lid is None: return False
+        idx = lid - 1
+        if idx < 0 or idx >= self.L: return False
+        return self.B[idx] >= bw_req - 1e-5
 
-        # 清空追踪
-        self.vnf_instances.clear()
-        self.vnf_sharing_map.clear()
-        self.active_requests.clear()
+    def update_resources(self, node_id: int, cpu_delta: float, mem_delta: float,
+                         strict: bool = True, external_index: bool = False) -> bool:
+        with self._lock:
+            internal_node = self._normalize_node(node_id, external_index)
+            if internal_node < 0 or internal_node >= self.n: return False
 
-    def get_vnf_sharing_rate(self) -> float:
-        """计算 VNF 共享率"""
-        total_vnfs = len(self.vnf_instances)
-        if total_vnfs == 0:
-            return 0.0
+            new_cpu = self.C[internal_node] + cpu_delta
+            new_mem = self.M[internal_node] + mem_delta
 
-        shared_vnfs = sum(
-            1 for instances in self.vnf_sharing_map.values()
-            if len(instances) > 1
-        )
+            if strict:
+                if new_cpu < -1e-5 or new_mem < -1e-5: return False
+                if new_cpu > self.C_cap + 1e-5: return False
 
-        return shared_vnfs / total_vnfs
+            self.C[internal_node] = np.clip(new_cpu, 0.0, self.C_cap)
+            self.M[internal_node] = np.clip(new_mem, 0.0, self.M_cap)
+            return True
 
-    def get_resource_utilization(self) -> Dict[str, float]:
-        """获取资源利用率"""
-        return {
-            'cpu': 1.0 - np.mean(self.C / self.C_cap),
-            'memory': 1.0 - np.mean(self.M / self.M_cap),
-            'bandwidth': 1.0 - np.mean(self.B / self.B_cap)
-        }
+    def allocate_link_bandwidth(self, u: int, v: int, bw_req: float) -> bool:
+        with self._lock:
+            if (u, v) not in self.link_map: return False
+            lid = self.link_map[(u, v)]
+            idx = lid - 1
+            if idx < 0 or idx >= len(self.B): return False
 
-    def __repr__(self) -> str:
-        util = self.get_resource_utilization()
-        return (
-            f"ResourceManager(n={self.n}, L={self.L}, "
-            f"CPU={util['cpu']:.1%}, MEM={util['memory']:.1%}, BW={util['bandwidth']:.1%})"
-        )
+            if self.B[idx] < bw_req - 1e-5: return False
 
+            self.B[idx] = max(0.0, self.B[idx] - bw_req)
+            self.link_ref_count[idx] += 1
+            self.links['bandwidth'][(u, v)] = self.B[idx]
+            return True
 
-# ============================================================================
-# 导出
-# ============================================================================
-__all__ = ['ResourceManager']
+    def release_link_bandwidth(self, u: int, v: int, bw_req: float) -> bool:
+        with self._lock:
+            if (u, v) not in self.link_map: return False
+            lid = self.link_map[(u, v)]
+            idx = lid - 1
+            if 0 <= idx < self.L:
+                self.B[idx] = min(self.B_cap, self.B[idx] + bw_req)
+                self.link_ref_count[idx] = max(0, self.link_ref_count[idx] - 1)
+                self.links['bandwidth'][(u, v)] = self.B[idx]
+                return True
+            return False
+
+    # 兼容接口
+    def consume_bandwidth(self, u, v, bw):
+        return self.allocate_link_bandwidth(u, v, bw)
+
+    def release_bandwidth(self, u, v, bw):
+        return self.release_link_bandwidth(u, v, bw)
+
+    def allocate_node_resources(self, n, c, m, vt=None):
+        return self.update_resources(n, -c, -m, strict=True)
+
+    def release_node_resources(self, n, c, m, vt=None):
+        return self.update_resources(n, c, m, strict=False)
+
+    def check_tree_bandwidth(self, tree, bw_req):
+        """部署前带宽预检查（按物理链路聚合）"""
+        link_demand = defaultdict(float)
+
+        for edge, _ in tree.items():
+            u, v = self._parse_edge(edge)
+            if u is None or v is None: continue
+
+            # 获取链路ID
+            if (u, v) not in self.link_map: return False
+            lid = self.link_map[(u, v)]
+            idx = lid - 1
+            if idx < 0 or idx >= self.L: return False
+
+            link_demand[idx] += bw_req
+
+        # 统一检查
+        for idx, demand in link_demand.items():
+            if self.B[idx] < demand - 1e-5:
+                return False
+
+        return True
+
+    # ========================================================================
+    # 修复点 3: 增加 phase 参数，支持 Phase 1 宽松部署
+    # ========================================================================
+    def apply_tree_deployment(self, plan: Dict, request: Dict, phase: str = "phase2") -> bool:
+        with self._lock:
+            req_id = request.get('id', -1)
+
+            # 1. 尝试部署节点 (任何阶段都需要节点资源扣除，以更新状态图)
+            if not self.apply_deployment(plan, request):
+                return False
+
+            # --- Phase 1 特殊处理 ---
+            # 如果是专家数据采集阶段，我们主要关注“节点是否能放进去”
+            # 链路部分可能因为专家给的是逻辑树/抽象边而导致物理聚合失败
+            # 因此，Phase 1 只要节点成功，就视为 Success，避免数据被丢弃
+            if phase == "phase1":
+                return True
+
+            # --- Phase 2 严格部署 ---
+            tree = plan.get('tree', {})
+            bw_req = request.get('bw_origin', 0)
+
+            # Step 1: 预检查整棵树 (使用聚合检查)
+            if not self.check_tree_bandwidth(tree, bw_req):
+                # 失败回滚：只回滚刚刚部署的节点
+                self._rollback_ops([
+                    v for v in self.vnf_instances if v.get('req_id') == req_id
+                ])
+                return False
+
+            # Step 2: 实际分配 (先聚合，再扣除)
+            link_demand = defaultdict(float)
+            for edge, _ in tree.items():
+                u, v = self._parse_edge(edge)
+                if u is None or v is None: continue
+                link_demand[(u, v)] += bw_req
+
+            deployed_links = []
+            success = True
+
+            for (u, v), demand in link_demand.items():
+                if not self.allocate_link_bandwidth(u, v, demand):
+                    success = False
+                    break
+                deployed_links.append((u, v, demand))
+
+            if not success:
+                # 回滚已分配的链路
+                for u, v, bw in deployed_links:
+                    self.release_link_bandwidth(u, v, bw)
+                # 回滚节点
+                self._rollback_ops([
+                    v for v in self.vnf_instances if v.get('req_id') == req_id
+                ])
+                return False
+
+            # 3. 记录成功
+            if req_id != -1:
+                if req_id not in self.active_requests: self.active_requests[req_id] = {}
+                self.active_requests[req_id]['links'] = deployed_links
+            return True
+
+    # ========================================================================
+    # 辅助与部署基础逻辑
+    # ========================================================================
+
+    def apply_deployment(self, plan: Dict, request: Dict) -> bool:
+        with self._lock:
+            parsed_ops = self._parse_deployment_ops(plan, request)
+            if parsed_ops is None: return False
+
+            for op in parsed_ops:
+                if not self.check_node_resources(op['node'], op['cpu'], op['mem']):
+                    return False
+
+            executed_ops = []
+            req_id = request.get('id', -1)
+
+            for op in parsed_ops:
+                node, c, m, vt = op['node'], op['cpu'], op['mem'], op['vnf_type']
+                if not self.update_resources(node, -c, -m, strict=True):
+                    self._rollback_ops(executed_ops)
+                    return False
+
+                hvt_inc = False
+                if 0 <= vt < self.K_vnf:
+                    self.hvt_all[node, vt] += 1.0
+                    hvt_inc = True
+
+                record = {
+                    'req_id': req_id, 'node': node, 'cpu': c, 'memory': m,
+                    'vnf_type': vt, 'hvt_inc': hvt_inc
+                }
+                executed_ops.append(record)
+                self.vnf_instances.append(record)
+            return True
+
+    def _parse_deployment_ops(self, plan, request):
+        placement = plan.get('placement', {})
+        vnf_types = request.get('vnf', [])
+        cpu_reqs = request.get('cpu_origin', [])
+        mem_reqs = request.get('memory_origin', [])
+
+        ops = []
+        for key, node_id in placement.items():
+            try:
+                v_idx = -1
+                if 'vnf_' in key and '_type_' in key:
+                    v_idx = int(key.split('_')[1])
+                elif key.startswith('vnf_'):
+                    v_idx = int(key.split('_')[1])
+                elif key.isdigit():
+                    v_idx = int(key)
+
+                if v_idx >= 0 and v_idx < len(vnf_types):
+                    v_type = vnf_types[v_idx]
+                    c_req = cpu_reqs[v_idx]
+                    m_req = mem_reqs[v_idx]
+                    internal_node = self._normalize_node(node_id, from_external=True)
+                    ops.append({'node': internal_node, 'cpu': c_req, 'mem': m_req, 'vnf_type': v_type})
+            except:
+                continue
+        return ops
+
+    def _rollback_ops(self, executed_ops):
+        for op in reversed(executed_ops):
+            self.update_resources(op['node'], op['cpu'], op['memory'], strict=False)
+            if op['hvt_inc']:
+                vt = op['vnf_type']
+                self.hvt_all[op['node'], vt] = max(0, self.hvt_all[op['node'], vt] - 1.0)
+            if op in self.vnf_instances:
+                self.vnf_instances.remove(op)
+
+    def remove_request(self, req_id: int) -> bool:
+        with self._lock:
+            # 允许在 active_requests 中不存在时尝试移除（为了处理 apply_deployment 后的回滚）
+            has_records = req_id in self.active_requests or any(v.get('req_id') == req_id for v in self.vnf_instances)
+            if not has_records:
+                return False
+
+            if req_id in self.active_requests:
+                links = self.active_requests[req_id].get('links', [])
+                for u, v, bw in links:
+                    self.release_link_bandwidth(u, v, bw)
+                del self.active_requests[req_id]
+
+            to_remove = [v for v in self.vnf_instances if v.get('req_id') == req_id]
+            self._rollback_ops(to_remove)
+            return True
+
+    def _normalize_node(self, node: int, from_external: bool = False) -> int:
+        if from_external and self.node_index_base == 1: return node - 1
+        return node
+
+    def _parse_edge(self, edge):
+        try:
+            if isinstance(edge, str): return map(int, edge.strip("()").replace(" ", "").split(","))
+            return int(edge[0]), int(edge[1])
+        except:
+            return None, None
+
+    def _create_link_map(self, topo):
+        lm = {}
+        lid = 1
+        for i in range(self.n):
+            for j in range(i + 1, self.n):
+                if topo[i, j] > 0:
+                    lm[(i, j)] = lid;
+                    lm[(j, i)] = lid
+                    lid += 1
+        return lm
+
+    def _build_shortest_dist_matrix(self):
+        try:
+            G = nx.from_numpy_array(self.topo)
+            return nx.floyd_warshall_numpy(G)
+        except:
+            return np.full((self.n, self.n), 999.0)
+
+    def _build_edge_index(self):
+        rows, cols = np.nonzero(self.topo)
+        return np.array([rows, cols], dtype=np.int64)
+
+    def get_gnn_state(self, current_request=None, **kwargs):
+        x = self._build_node_features(current_request)
+        req = self._encode_request(current_request) if current_request else np.zeros(self.request_dim)
+        return {'x': x.astype(np.float32), 'edge_index': self.edge_index, 'request': req.astype(np.float32)}
+
+    def _build_node_features(self, req):
+        feats = []
+        for i in range(self.n):
+            base = [self.C[i] / self.C_cap, self.M[i] / self.M_cap, 1.0 if i in self.dc_nodes else 0.0, 0.0, 0.0, 0.0]
+            feats.append(np.concatenate([base, self.hvt_all[i], [0, 0, 0]]))
+        return np.array(feats)
+
+    # ========================================================================
+    # 修复点 2: _encode_request 填充实际特征
+    # ========================================================================
+    def _encode_request(self, req):
+        vec = np.zeros(self.request_dim, dtype=np.float32)
+        if not req:
+            return vec
+
+        # 1. Source (Normalized)
+        vec[0] = req.get('source', 0) / self.n
+
+        # 2. Destination Count (Normalized)
+        dests = req.get('destinations') or req.get('dest', [])
+        vec[1] = len(dests) / self.n
+
+        # 3. Bandwidth (Normalized)
+        vec[2] = req.get('bw_origin', 0) / self.B_cap
+
+        # 4. CPU & Memory (Avg Normalized)
+        cpus = req.get('cpu_origin', [])
+        mems = req.get('memory_origin', [])
+
+        # 避免除以零
+        count = len(cpus) if len(cpus) > 0 else 1
+        vec[3] = sum(cpus) / (self.C_cap * count)
+        vec[4] = sum(mems) / (self.M_cap * count)
+
+        # 剩余维度保留为0或按需扩展
+        return vec

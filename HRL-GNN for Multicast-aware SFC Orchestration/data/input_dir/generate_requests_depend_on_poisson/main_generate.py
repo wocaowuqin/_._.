@@ -19,8 +19,7 @@ NUM_NODES = 28
 DC_NODES = [1, 2, 3, 4, 5, 6, 7, 8, 11, 13, 14, 17, 18, 19, 20, 23]
 
 # ✅ 重要节点（汇聚节点，可以作为目标，但不能作为源）
-node_important = [16, 21, 22, 24, 25, 26, 27, 28]
-
+NODE_IMPORTANT = [16, 21, 22, 24, 25, 26, 27, 28]
 # ========== 请求参数 ==========
 NUM_DESTINATIONS = 5  # 每个请求的目标数
 VNF_CHAIN_LENGTH = 3  # VNF链长度
@@ -166,51 +165,47 @@ def generate_requests_for_source(source_node, arrive_times, all_nodes):
 
 def generate_all_requests(T=200, lamda=0.6, seed=None):
     """
-    生成所有请求
+    生成所有请求 (完全复刻 MATLAB 逻辑)
 
-    ✅ 关键修改：源节点从 DC_NODES 中选择，而不是 node_important
-
-    Args:
-        T: 时间范围
-        lamda: 泊松到达率
-        seed: 随机种子
+    修改点：
+    1. 源节点遍历 NODE_IMPORTANT
+    2. 目的节点池限制为 NODE_IMPORTANT
     """
     if seed is not None:
         random.seed(seed)
         np.random.seed(seed)
 
     print("=" * 70)
-    print("生成请求数据")
+    print("生成请求数据 (MATLAB Logic Mode)")
     print("=" * 70)
     print(f"\n配置:")
     print(f"  时间范围: {T}")
     print(f"  到达率: {lamda}")
-    print(f"  DC节点数: {len(DC_NODES)}")
-    print(f"  源节点池: DC节点 {DC_NODES[:5]}...")
-    print(f"  目标节点池: 所有节点 [1-28]")
+    print(f"  重要节点集合 (Source & Dest Pool): {NODE_IMPORTANT}")
     print(f"  VNF链长度: {VNF_CHAIN_LENGTH}")
     print(f"  目标数量: {NUM_DESTINATIONS}")
 
     all_requests = []
 
-    # ✅ 关键修改：为每个 DC 节点生成请求
-    for source_node in DC_NODES:
-        print(f"\n为DC节点 {source_node} 生成请求...")
+    # ✅ 关键修改 1：遍历重要节点 (MATLAB: for s = 1 : length(node_important))
+    for source_node in NODE_IMPORTANT:
+        print(f"\n为重要节点 {source_node} 生成请求...")
 
         # 生成到达时间
         arrive_times = generate_poisson_arrivals(T, lamda)
         print(f"  生成了 {len(arrive_times)} 个到达事件")
 
-        # 生成请求
+        # ✅ 关键修改 2：目标节点池限制为 NODE_IMPORTANT (MATLAB: dest = temp_node_important(...))
+        # 注意：generate_requests_for_source 内部会自动执行 (all_nodes - source) 的排己操作
         requests = generate_requests_for_source(
             source_node=source_node,
             arrive_times=arrive_times,
-            all_nodes=list(range(1, NUM_NODES + 1))
+            all_nodes=NODE_IMPORTANT  # <--- 这里传重要节点，而不是全网节点
         )
 
         all_requests.extend(requests)
 
-    # 按到达时间排序
+    # 按到达时间排序 (MATLAB: [sorted_arrive_time,sortedIndex] = sort...)
     all_requests.sort(key=lambda r: r['arrival_time'])
 
     # 重新编号
@@ -219,11 +214,10 @@ def generate_all_requests(T=200, lamda=0.6, seed=None):
 
     print(f"\n" + "=" * 70)
     print(f"✓ 总共生成 {len(all_requests)} 个请求")
-    print(f"✓ 平均每个DC节点: {len(all_requests) / len(DC_NODES):.1f} 个请求")
+    print(f"✓ 覆盖源节点: {len(NODE_IMPORTANT)} 个")
     print("=" * 70)
 
     return all_requests
-
 
 def save_requests(requests, filename):
     """保存请求到文件"""
