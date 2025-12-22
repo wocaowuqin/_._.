@@ -294,21 +294,25 @@ class ResourceManager:
 
     def check_tree_bandwidth(self, tree, bw_req):
         """部署前带宽预检查（按物理链路聚合）"""
+        from collections import defaultdict
         link_demand = defaultdict(float)
 
+        # 1. 聚合需求到物理链路
         for edge, _ in tree.items():
             u, v = self._parse_edge(edge)
-            if u is None or v is None: continue
+            if u is None or v is None:
+                continue
 
-            # 获取链路ID
-            if (u, v) not in self.link_map: return False
+            if (u, v) not in self.link_map:
+                return False
             lid = self.link_map[(u, v)]
             idx = lid - 1
-            if idx < 0 or idx >= self.L: return False
+            if idx < 0 or idx >= self.L:
+                return False
 
-            link_demand[idx] += bw_req
+            link_demand[idx] += bw_req  # ✅ 累加（关键修复）
 
-        # 统一检查
+        # 2. 统一检查聚合后的需求
         for idx, demand in link_demand.items():
             if self.B[idx] < demand - 1e-5:
                 return False

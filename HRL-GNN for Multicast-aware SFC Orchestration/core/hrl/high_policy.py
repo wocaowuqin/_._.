@@ -65,18 +65,29 @@ class HierarchicalPolicy(nn.Module):
             # 检查是否是向量化版本（输出100维）
             logger.info(f"检测GNN输出类型: gnn_output_type={gnn_output_type}, gnn_output_dim={self.gnn_output_dim}")
 
-        # Action 维度
-        action_dim = deep_get(
-            config,
-            ["action_dim", "num_actions", "action_size", "n_actions"],
-        )
+        # 🔥 关键修复：优先从 environment 配置读取 action_dim
+        # Phase 2/3 的 action_dim 应该等于节点数
+        env_cfg = config.get('environment', {})
+        action_dim = env_cfg.get('nb_low_level_actions', None)
+
+        # 如果环境配置中没有，再尝试其他位置
+        if action_dim is None:
+            action_dim = deep_get(
+                config,
+                ["action_dim", "num_actions", "action_size", "n_actions"],
+            )
+
         if action_dim is None:
             action_dim = deep_get(config, ["action_space"], None)
+
         if isinstance(action_dim, (list, tuple)):
             action_dim = len(action_dim)
+
         if action_dim is None:
-            action_dim = 100  # 工程级兜底
+            action_dim = 28  # 工程级兜底
             logger.warning(f"Action维度未指定，使用默认值: {action_dim}")
+
+        logger.info(f"✅ Action维度确定: {action_dim}")
 
         dropout = deep_get(config, ["dropout"], 0.0)
 
@@ -115,7 +126,7 @@ class HierarchicalPolicy(nn.Module):
             edge_feat_dim=edge_feat_dim,
             request_dim=request_feat_dim,
             hidden_dim=hidden_dim,
-            action_dim=action_dim,
+            # 🔥 修复：移除 action_dim，GNN 应该输出 hidden_dim
             dropout=dropout,
         )
 
@@ -129,7 +140,7 @@ class HierarchicalPolicy(nn.Module):
         elif self.gnn_output_type == "hidden":
             # 🔥 修复：使用实际 GNN 输出维度
             # 如果gnn_output_dim未设置，则使用hidden_dim
-            actual_gnn_output_dim = self.gnn_output_dim if self.gnn_output_dim != hidden_dim else 100
+            actual_gnn_output_dim = self.gnn_output_dim
 
             self.policy_head = nn.Sequential(
                 nn.Linear(actual_gnn_output_dim, hidden_dim),

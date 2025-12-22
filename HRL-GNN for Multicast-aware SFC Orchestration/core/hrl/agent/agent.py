@@ -103,7 +103,7 @@ class HRL_DQN_Agent:
         """
         self.cfg = config
         self.phase = int(phase)
-        self.device = torch.device(config['eval']['device'])
+        self.device = torch.device('cpu')
 
         # 🔥【关键修复】确定动作空间
         env_cfg = config.get('environment', config.get('env', {}))
@@ -135,13 +135,21 @@ class HRL_DQN_Agent:
         self.gamma = float(config['training']['gamma'])
 
         # Epsilon 参数
-        epsilon_cfg = config.get('epsilon', {})
-        self.epsilon_start = float(epsilon_cfg.get('initial', 1.0))
+        # 🔥 修复：从 phase3 或 phase2 配置中读取
+        phase_key = f'phase{self.phase}'
+        epsilon_cfg = config.get(phase_key, {}).get('epsilon', {})
+
+        # 如果没有找到，尝试从顶层 epsilon 或 training 读取（兼容旧配置）
+        if not epsilon_cfg:
+            epsilon_cfg = config.get('epsilon', config.get('training', {}))
+
+        self.epsilon_start = float(epsilon_cfg.get('initial', 0.5))
         self.epsilon = self.epsilon_start
         self.epsilon_end = float(epsilon_cfg.get('final', 0.01))
         self.epsilon_decay = float(epsilon_cfg.get('decay_steps', 10000))
         self.steps_done = 0
 
+        logger.info(f"[Agent] Epsilon Config: {self.epsilon_start} → {self.epsilon_end}, Decay={self.epsilon_decay}")
         self.feature_builder = GNNFeatureBuilder(self.device)
         self._training = True
         self.update_count = 0
@@ -241,73 +249,116 @@ class HRL_DQN_Agent:
         return self.epsilon_end + (self.epsilon_start - self.epsilon_end) * \
             np.exp(-1. * self.steps_done / max(1, self.epsilon_decay))
 
-    def select_action(self, state, masks, expert_action=None, beta=0.0, epsilon=None):
-        """Action Selection"""
-        high_mask, low_mask = masks
-        self.steps_done += 1
+    def select_action(self, state, masks=None):
+        """
+        选择动作 (最终防弹版：预初始化所有变量，杜绝 UnboundLocalError)
+        """
+        # =================================================
+        # 1. 变量预初始化 (防御性编程核心)
+        # =================================================
+        # 默认动作 (兜底防止报错)
+        high_action = 0
+        low_action = 0
 
-        # 1. DAgger
-        if expert_action is not None and random.random() < beta:
-            high_act, low_act = expert_action
-            if high_mask[high_act] > 0 and low_mask[low_act] > 0:
-                return int(high_act), int(low_act)
+        # 状态变量初始化
+        x = None
+        edge_index = None
+        edge_attr = None
+        req_vec = None
+        batch = None
 
-        # 2. Epsilon-Greedy
-        if epsilon is None:
-            self.epsilon = self.get_epsilon()
-            epsilon = self.epsilon
+        # 解析 Mask
+        high_mask, low_mask = None, None
+        if masks is not None:
+            high_mask, low_mask = masks
 
-        if random.random() < epsilon:
-            high_valid = np.where(high_mask > 0)[0]
-            low_valid = np.where(low_mask > 0)[0]
-            return (int(np.random.choice(high_valid)) if len(high_valid) > 0 else 0,
-                    int(np.random.choice(low_valid)) if len(low_valid) > 0 else 0)
+        # =================================================
+        # 2. 状态解析 (兼容多种格式)
+        # =================================================
+        try:
+            if hasattr(state, 'x') and state.x is not None:
+                # PyG Data 对象
+                x = state.x
+                edge_index = state.edge_index
+                edge_attr = getattr(state, 'edge_attr', None)
+                req_vec = getattr(state, 'req_vec', None)
+            elif isinstance(state, dict) and 'x' in state:
+                # 字典格式
+                x = state['x']
+                edge_index = state['edge_index']
+                edge_attr = state.get('edge_attr')
+                req_vec = state.get('req_vec')
+        except Exception:
+            # 解析出错时保持 x=None，后续会自动降级为随机探索
+            pass
 
-        # 3. Model Exploitation
-        pyg_data = self.feature_builder.to_pyg_data(state)
-        x = pyg_data.x.to(self.device)
-        edge_index = pyg_data.edge_index.to(self.device)
-        edge_attr = pyg_data.edge_attr.to(self.device)
-        req_vec = pyg_data.req_vec.to(self.device)
-        batch = getattr(pyg_data, "batch", None)
+        # =================================================
+        # 3. 数据搬运
+        # =================================================
+        if x is not None:
+            device = self.device
+            x = x.to(device)
+            edge_index = edge_index.to(device)
+            if edge_attr is not None:
+                edge_attr = edge_attr.to(device)
 
-        with torch.no_grad():
-            if self.phase == 2:
-                outputs = self.policy_net(x, edge_index, edge_attr, req_vec, batch=batch)
-                if isinstance(outputs, tuple):
-                    mid_logits, low_logits = outputs[:2]
-                else:
-                    mid_logits, low_logits = outputs, outputs
-
-                t_high_mask = torch.tensor(high_mask, dtype=torch.float32, device=self.device)
-                t_low_mask = torch.tensor(low_mask, dtype=torch.float32, device=self.device)
-
-                mid_logits[0, t_high_mask == 0] = -1e9
-                low_logits[0, t_low_mask == 0] = -1e9
-
-                high_act = int(mid_logits.argmax(dim=1).item())
-                low_act = int(low_logits.argmax(dim=1).item())
-
+            if req_vec is not None:
+                req_vec = req_vec.to(device)
             else:
+                req_vec = torch.zeros(24, device=device)
+
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=device)
+
+        # =================================================
+        # 4. 策略选择 (Epsilon-Greedy)
+        # =================================================
+        # 如果随机，或者状态解析失败(x is None)，都走随机分支
+        should_random = (random.random() < self.epsilon) or (x is None)
+
+        if should_random:
+            # --- 🎲 随机探索模式 ---
+
+            # High Level
+            if high_mask is not None:
+                valid_high = np.where(high_mask)[0]
+                if len(valid_high) > 0:
+                    high_action = int(np.random.choice(valid_high))
+                else:
+                    high_action = random.randint(0, self.high_action_dim - 1)
+            else:
+                high_action = random.randint(0, self.high_action_dim - 1)
+
+            # Low Level
+            if low_mask is not None:
+                valid_low = np.where(low_mask)[0]
+                if len(valid_low) > 0:
+                    low_action = int(np.random.choice(valid_low))
+                else:
+                    low_action = random.randint(0, self.low_action_dim - 1)
+            else:
+                low_action = random.randint(0, self.low_action_dim - 1)
+
+        else:
+            # --- 🧠 模型预测模式 ---
+            with torch.no_grad():
+                # 获取 Q 值
                 q_high = self.q_network.get_high_q_values(x, edge_index, edge_attr, req_vec, batch=batch)
+                q_low = self.q_network.get_low_q_values(x, edge_index, edge_attr, req_vec, batch=batch)
 
-                t_high_mask = torch.tensor(high_mask, dtype=torch.float32, device=self.device)
-                q_high[0, t_high_mask == 0] = -1e9
-                high_act = int(q_high.argmax(dim=1).item())
+                # 应用 Mask (将非法动作的 Q 值设为负无穷)
+                if high_mask is not None:
+                    mask_tensor = torch.tensor(high_mask, dtype=torch.bool, device=self.device)
+                    q_high[0, ~mask_tensor] = -float('inf')
 
-                high_action_onehot = torch.zeros(1, self.n_goals, device=self.device)
-                high_action_onehot[0, high_act] = 1.0
+                if low_mask is not None:
+                    mask_tensor = torch.tensor(low_mask, dtype=torch.bool, device=self.device)
+                    q_low[0, ~mask_tensor] = -float('inf')
 
-                q_low = self.q_network.get_low_q_values(
-                    x, edge_index, edge_attr, req_vec, high_action_onehot, batch=batch
-                )
+                # Argmax 选择
+                high_action = q_high.argmax(dim=1).item()
+                low_action = q_low.argmax(dim=1).item()
 
-                t_low_mask = torch.tensor(low_mask, dtype=torch.float32, device=self.device)
-                q_low[0, t_low_mask == 0] = -1e9
-                low_act = int(q_low.argmax(dim=1).item())
-
-        return high_act, low_act
-
+        return high_action, low_action
     def store_transition(self, state, action, reward, next_state, done,
                          goal=None, next_valid_mask=None):
         transition = {

@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 REQ_PATH = r"/data/input_dir/generate_requests_depend_on_poisson/data_output/phase1_requests.pkl"
-EVT_PATH = r"E:\pycharmworkspace\SFC-master\HRL-GNN for Multicast-aware SFC Orchestration\data\input_dir\phase1_events.pkl"
+EVT_PATH = r"/data/input_dir/generate_requests_depend_on_poisson/16个DC节点/phase1_events.pkl"
 
 
 def load_pkl(path):

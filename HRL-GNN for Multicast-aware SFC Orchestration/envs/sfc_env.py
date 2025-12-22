@@ -251,20 +251,19 @@ class SFC_HIRL_Env(gym.Env):
         )
 
         # ========================================
-        # 11. 初始化奖励评估器
+        # 11. 初始化奖励评估器 [关键修改]
         # ========================================
         training_phase = 3
-        epoch = 0
-        max_epochs = config.get('phase3', {}).get('n_episodes', 300)
-        reward_params = config.get('reward', None)
 
+        # 从 config 中获取 reward 参数，默认为空字典
+        reward_params = config.get('reward', {})
+
+        # 🔥 修改点：移除了 epoch 和 max_epochs 参数
+        # 新版 RewardCritic 只接收 training_phase 和 params
         self.reward_critic = RewardCritic(
             training_phase=training_phase,
-            epoch=epoch,
-            max_epochs=max_epochs,
             params=reward_params
         )
-
         # ========================================
         # 12. 初始化失败可视化器
         # ========================================
@@ -338,11 +337,9 @@ class SFC_HIRL_Env(gym.Env):
         self.action_space = gym.spaces.Discrete(self.n)
 
         logger.info(f"✅ 环境初始化完成: n={self.n}, L={self.L}, K_vnf={self.K_vnf}")
-
     # =========================================================================
     # 2. 数据加载与重置
     # =========================================================================
-
     def load_dataset(self, phase_or_req_file: str, events_file: Optional[str] = None) -> bool:
         """加载数据集（兼容两种调用方式）"""
         if events_file is not None:
@@ -396,34 +393,6 @@ class SFC_HIRL_Env(gym.Env):
                 return False
         else:
             return self.data_loader.load_dataset(phase_or_req_file)
-
-    def reset(self, *, seed=None, options=None):
-        """Gym 标准 Reset"""
-        super().reset(seed=seed)
-
-        phase = "phase3"
-        if options is not None:
-            phase = options.get("phase", phase)
-
-        logger.debug(f"[Env] reset() called, phase={phase}")
-
-        self._reset_core()
-
-        # 🔥【修复】Phase 3 防止重复加载数据集
-        if phase == 'phase3' and len(self.requests) > 0:
-            logger.debug("[Env] Phase3 requests already loaded, skipping reload.")
-        else:
-            if not self.load_dataset(phase):
-                # 只有在真的没数据时才报错，或者尝试加载
-                if len(self.requests) == 0:
-                    logger.warning(f"⚠️ Failed to load dataset for {phase}, but allowing continue if intended.")
-                pass
-
-        req, _ = self.reset_request()
-        obs = self.get_state()
-        info = {"phase": phase}
-        return obs, info
-
     def _reset_core(self):
         """核心重置逻辑"""
         if hasattr(self, 'resource_mgr') and self.resource_mgr is not None:
@@ -440,46 +409,107 @@ class SFC_HIRL_Env(gym.Env):
 
         self.current_request = None
         self.step_counter = 0
+    def reset(self, *, seed=None, options=None):
+        """Gym 标准 Reset (强制随机化修复版)"""
+        super().reset(seed=seed)
+
+        phase = "phase3"
+        if options is not None:
+            phase = options.get("phase", phase)
+
+        self._reset_core()
+
+        # --- 1. 数据加载逻辑 ---
+        if not hasattr(self.data_loader, 'requests') or len(self.data_loader.requests) == 0:
+            if not self.load_dataset(phase):
+                logger.warning(f"⚠️ Failed to load dataset for {phase}")
+
+        # =====================================================
+        # 🔥【强制随机化】每次 Reset 都打乱请求顺序
+        # =====================================================
+        if hasattr(self.data_loader, 'requests') and len(self.data_loader.requests) > 0:
+            import random
+
+            # 完全随机打乱
+            random.shuffle(self.data_loader.requests)
+
+            # 🔥 重置请求索引（关键！）
+            self._request_index = 0
+
+            # 调试日志
+            first_req_id = self.data_loader.requests[0].get('id', 'Unknown')
+            first_req_src = self.data_loader.requests[0].get('source', 'Unknown')
+            print(f"🔄 [RESET] 数据集已打乱，首个请求 ID={first_req_id}, Source={first_req_src}")
+
+        # --- 3. 获取第一个请求 ---
+        req, _ = self.reset_request()
+
+        if req is None:
+            return self.get_state(), {"phase": phase, "error": "no_requests"}
+
+        obs = self.get_state()
+        info = {"phase": phase}
+        return obs, info
 
     def reset_request(self) -> Tuple[Optional[Dict], Any]:
-        """重置并获取下一个请求"""
+        """重置请求（全自动修复 1-based 数据偏移）"""
         self.policy_helper.clear_cache()
         self.current_request = None
         self._prev_dist = None
         self.reward_critic.on_new_request()
 
-        while True:
-            leaves = self.data_loader.get_current_leaves()
-            self.event_handler.process_leaves(leaves)
+        if not hasattr(self, '_request_index'):
+            self._request_index = 0
 
-            arrivals = self.data_loader.get_current_arrivals()
-            if arrivals:
-                self.current_request = arrivals[0]
-                break
+        if self._request_index >= len(self.data_loader.requests):
+            logger.info("[Env] No more requests")
+            return None, self.get_state()
 
-            self.data_loader.advance_time()
-            if self.data_loader.is_done():
-                logger.info("[Env] No more requests in dataset")
-                return None, self.get_state()
-
+        # 读取原始请求
+        raw_req = self.data_loader.requests[self._request_index]
+        self._request_index += 1
         self.total_requests_seen += 1
-        req = self.current_request
 
-        dests = req.get("dest", [])
-        self.unadded_dest_indices = set(range(len(dests)))
-        self.nodes_on_tree = {req["source"]}
+        # 🔥🔥🔥【数据清洗】🔥🔥🔥
+        req = raw_req.copy()
 
-        # 🔥【修复】tree 初始化为 Dict (再次确保)
+        # 1. 修复 Node ID (如果发现 >= 28，说明是 1-based)
+        src = req.get("source", 0)
+        if src >= self.n:
+            src -= 1
+            req['source'] = src
+
+        new_dests = []
+        for d in req.get("dest", []):
+            new_dests.append(d - 1 if d >= self.n else d)
+        req['dest'] = new_dests
+
+        # 2. 修复 VNF Type ID (如果发现 >= 8，说明是 1-based)
+        # 您的 K_vnf 是 8，所以合法索引是 0~7
+        new_vnfs = []
+        for v in req.get('vnf', []):
+            if v >= self.K_vnf:
+                new_vnfs.append(v - 1)
+            else:
+                new_vnfs.append(v)
+        req['vnf'] = new_vnfs
+
+        # 3. 初始化状态
+        self.current_request = req
+        self.unadded_dest_indices = set(range(len(new_dests)))
+
+        # 确保位置初始化正确
+        start_node = req['source']
+        self.current_node_location = start_node
+        self.nodes_on_tree = {start_node}
+
+        # 重置 Tree
         self.current_tree = {
-            "id": req["id"],
-            "tree": {},  # ✅ 绝对不能是 np.zeros
-            "hvt": np.zeros((self.resource_mgr.n, self.resource_mgr.K_vnf), dtype=np.float32),
-            "paths_map": {}
+            'hvt': np.zeros((self.n, self.K_vnf), dtype=np.float32),
+            'tree': {}
         }
 
-        self.path_manager.reset()
         return req, self.get_state()
-
     def _reset_current_request(self):
         """内部使用：获取下一个到达的请求"""
         arrivals = self.data_loader.get_current_arrivals()
@@ -495,7 +525,7 @@ class SFC_HIRL_Env(gym.Env):
         dests = req.get('dest', [])
         self.unadded_dest_indices = set(range(len(dests)))
         self.nodes_on_tree = {req['source']}
-
+        self.current_node_location = req['source']
         # 🔥【修复】tree 初始化为 Dict
         self.current_tree = {
             'tree': {},  # ✅ Dict
@@ -528,7 +558,6 @@ class SFC_HIRL_Env(gym.Env):
                 nodes_on_tree=self.nodes_on_tree,
                 current_tree=self.current_tree
             )
-
     # =========================================================================
     # 4. 分层动作执行
     # =========================================================================
@@ -546,82 +575,65 @@ class SFC_HIRL_Env(gym.Env):
             "remaining_dests": len(self.unadded_dest_indices)
         }
         return self.get_state(), 0.0, False, info
-
-    def step_low_level(self, action):
-        """低层动作"""
-        self.step_counter += 1
-
-        # 🔥【修复】防御性检查
-        tree_obj = self.current_tree.get('tree')
-        if not isinstance(tree_obj, dict):
-            logger.error(f"❌ [Fatal] current_tree['tree'] is {type(tree_obj)}, expected dict!")
-            self.current_tree['tree'] = {}  # 紧急修复
-            return self.get_state(), -10.0, True, False, {'error': 'tree_corrupted'}
-
-        # 动作验证
-        if not isinstance(action, (int, np.integer)):
-            action = int(action)
-
-        if not (0 <= action < self.n):
-            logger.error(f"❌ Invalid action: {action}, must be in [0, {self.n - 1}]")
-            return self.get_state(), -10.0, True, False, {'error': 'invalid_action'}
-
-        if self.current_request is None:
-            return self.get_state(), -10.0, True, False, {'error': 'no_request'}
-
-        req = self.current_request
-        vnf_types = req.get('vnf', [])
-        source = req.get('source', 0)
-        dests = req.get('dest', [])
-
-        # 部署方案
-        placement = {}
-        for i, vnf_type in enumerate(vnf_types):
-            placement[f"vnf_{i}_type_{vnf_type}"] = action
-
-        tree = {}
-        if source != action: tree[(source, action)] = 1.0
-        for dest in dests:
-            if dest != action: tree[(action, dest)] = 1.0
-
-        hvt = np.zeros((self.n, self.K_vnf), dtype=np.float32)
-        for i, vnf_type in enumerate(vnf_types):
-            if 0 <= action < self.n and 0 <= vnf_type < self.K_vnf:
-                hvt[action, vnf_type] = 1.0
-
-        plan = {'success': True, 'placement': placement, 'tree': tree, 'hvt': hvt}
-
+    def _get_action_metrics(self, node_action: int, tree_edges: Dict) -> Tuple[float, float, int]:
+        """
+        辅助方法：从资源管理器中提取当前动作的物理指标
+        返回: (cpu_remain, min_bandwidth, total_hops)
+        """
+        # 1. 获取选中节点的剩余 CPU
         try:
-            success = self.resource_mgr.apply_tree_deployment(plan, req)
-        except Exception as e:
-            logger.error(f"❌ Deployment failed: {e}")
-            success = False
+            # 根据 resource.py，self.C 是存储节点 CPU 的 numpy 数组
+            cpu_remain = float(self.resource_mgr.C[node_action])
+        except (IndexError, AttributeError) as e:
+            logger.warning(f"无法获取节点 {node_action} 的 CPU: {e}")
+            cpu_remain = 0.0
 
-        if success:
-            self.current_tree['hvt'] += hvt
-            # 🔥【修复】安全的字典更新
-            for edge_key, value in tree.items():
-                self.current_tree['tree'][edge_key] = (
-                        self.current_tree['tree'].get(edge_key, 0) + float(value)
-                )
-            self.total_requests_accepted += 1
-            reward = 1.0
+        # 2. 获取本次部署涉及链路的瓶颈带宽
+        min_bw = 99999.0
+        hops = 0
+
+        if tree_edges:
+            hops = len(tree_edges)
+            for edge_key, _ in tree_edges.items():
+                # 解析 edge_key, 可能是 tuple (u, v) 或 string "u-v"
+                u, v = None, None
+                if isinstance(edge_key, tuple):
+                    u, v = edge_key
+                elif isinstance(edge_key, str):
+                    try:
+                        u, v = map(int, edge_key.strip('()').split('-'))
+                    except ValueError:
+                        continue
+
+                if u is not None and v is not None:
+                    # 从 resource_mgr 中获取链路带宽
+                    # 优先使用 links['bandwidth'] 字典 (最准确，包含了动态扣除后的值)
+                    if (u, v) in self.resource_mgr.links['bandwidth']:
+                        bw = self.resource_mgr.links['bandwidth'][(u, v)]
+                        if bw < min_bw:
+                            min_bw = float(bw)
+                    # 备选：尝试从 edge_to_phys 映射去查 self.B 数组
+                    elif hasattr(self.resource_mgr, 'edge_to_phys') and (u, v) in self.resource_mgr.edge_to_phys:
+                        phys_id = self.resource_mgr.edge_to_phys[(u, v)]
+                        if phys_id < len(self.resource_mgr.B):
+                            bw = self.resource_mgr.B[phys_id]
+                            if bw < min_bw:
+                                min_bw = float(bw)
+
+            # 如果循环完了 min_bw 还是初始值，说明没找到有效链路信息
+            if min_bw > 90000.0:
+                min_bw = 0.0
         else:
-            reward = -1.0
+            # 如果没有边 (例如源节点=目的节点)，带宽设为 0
+            min_bw = 0.0
 
-        next_req, _ = self.reset_request()
+        return cpu_remain, min_bw, hops
 
-        done = (next_req is None)
-        truncated = (self.step_counter >= self.max_steps)
 
-        next_state = self.get_state()
-        info = {'step': self.step_counter, 'success': success}
-        return next_state, reward, done, truncated, info
 
     def step(self, action):
         state, reward, sub_done, req_done, info = self.step_low_level(action)
         return state, reward, req_done, info
-
     # =========================================================================
     # 5. 辅助方法
     # =========================================================================
@@ -636,17 +648,263 @@ class SFC_HIRL_Env(gym.Env):
         if not mask.any(): mask[:] = True
         return mask
 
+    def step_low_level(self, action):
+        """
+        [最终修复版] 分离移动和部署逻辑
+        """
+        self.step_counter += 1
+
+        # 基础验证
+        if not isinstance(action, (int, np.integer)):
+            action = int(action)
+        if not (0 <= action < self.n):
+            return self.get_state(), -10.0, True, False, {'error': 'invalid_action'}
+        if self.current_request is None:
+            return self.get_state(), -10.0, True, False, {'error': 'no_request'}
+
+        current_node = getattr(self, 'current_node_location',
+                               self.current_request.get('source', 0))
+        target_node = int(action)
+
+        # 判断意图：是想部署还是想移动？
+        # 如果当前位置符合部署条件，系统期望 Agent 选当前节点来触发部署
+        should_deploy = self._should_deploy_at_current_node()
+
+        if should_deploy:
+            # --- 部署模式 ---
+            if target_node != current_node:
+                # 惩罚：明明该部署了（到了金矿），却跑了
+                info = {
+                    'error': 'deploy_mode_mismatch',
+                    'msg': f'Expect deploy at {current_node}, got move to {target_node}'
+                }
+                # 这是一个严重错误，给予重罚但允许继续（或直接判负）
+                return self.get_state(), -5.0, False, False, info
+
+            # 执行部署
+            return self._execute_deployment(current_node)
+
+        else:
+            # --- 移动模式 ---
+            # 无论 target_node 是当前节点（等待）还是邻居（移动），都走移动逻辑
+            return self._execute_movement(current_node, target_node)
+
     def get_low_level_action_mask(self) -> np.ndarray:
-        # 简单掩码：如果还没生成树，允许所有；否则根据树生成
-        # 这里简化为允许所有，或者调用 policy_helper
-        if not self.current_tree.get('tree'):
+        """
+        [最终修正版] 动态 Mask
+        1. 部署模式 -> 只能选当前节点 (Action = Current Node)
+        2. 移动模式 -> 只能选邻居节点 (Action ∈ Neighbors, Exclude Current)
+        """
+        mask = np.zeros(self.NB_LOW_LEVEL_ACTIONS, dtype=np.bool_)
+
+        if self.current_request is None:
             return np.ones(self.NB_LOW_LEVEL_ACTIONS, dtype=np.bool_)
 
-        mask = self.policy_helper.get_low_level_action_mask(
-            self.path_manager, self.current_tree, self.NB_LOW_LEVEL_ACTIONS
-        )
-        if not mask.any(): mask[:] = True
+        current_node = getattr(self, 'current_node_location',
+                               self.current_request.get('source', 0))
+
+        # --- A. 部署模式 ---
+        # 如果当前位置满足部署条件，强制 Agent 选择原地不动来触发部署
+        if self._should_deploy_at_current_node():
+            if 0 <= current_node < self.n:
+                mask[current_node] = True
+            else:
+                mask[:] = True
+            return mask
+
+        # --- B. 移动模式 ---
+        # 如果不需要部署，强制 Agent 移动到邻居 (禁止原地发呆！)
+        if hasattr(self, 'topology_mgr'):
+            neighbors = self.topology_mgr.get_neighbors(current_node)
+        else:
+            neighbors = []
+
+        valid_count = 0
+        for node in neighbors:
+            if 0 <= node < self.n:
+                mask[node] = True
+                valid_count += 1
+
+        # 兜底：如果真的被围死无路可走，才允许原地等待
+        if valid_count == 0:
+            if 0 <= current_node < self.n:
+                mask[current_node] = True
+            else:
+                mask[:] = True
+
         return mask
+    def _should_deploy_at_current_node(self) -> bool:
+        """
+        判断是否应该在当前位置部署 VNF
+        """
+        if self.current_request is None:
+            return False
+
+        current_node = getattr(self, 'current_node_location',
+                               self.current_request.get('source', 0))
+
+        # 1. 位置合法性：必须是 DC 节点
+        if hasattr(self, 'dc_nodes') and current_node not in self.dc_nodes:
+            return False
+
+        # 2. 任务状态：是否还有 VNF 待部署
+        vnf_types = self.current_request.get('vnf', [])
+        deployed_count = len(self.current_tree.get('placement', {}))
+        if deployed_count >= len(vnf_types):
+            return False  # 任务已完成
+
+        # 3. 资源检查：当前节点 CPU 是否足够下一个 VNF
+        try:
+            cpu_needed = self.current_request.get('cpu_origin', [])[deployed_count]
+            if self.resource_mgr.C[current_node] < cpu_needed:
+                return False  # 资源不足
+        except Exception:
+            return False
+
+        return True
+
+    def _execute_deployment(self, deployment_node: int):
+        """执行 VNF 部署"""
+        req = self.current_request
+        vnf_types = req.get('vnf', [])
+        source = req.get('source', 0)
+        dests = req.get('dest', [])
+        deployed_count = len(self.current_tree.get('placement', {}))
+
+        # 1. 防御性检查
+        if deployed_count >= len(vnf_types):
+            return self.get_state(), -1.0, False, False, {'error': 'already_done'}
+
+        vnf_type = vnf_types[deployed_count]
+
+        # 2. 尝试资源部署 (调用 ResourceManager)
+        # 构造临时的 plan 对象传给 resource_mgr
+        placement = {f"vnf_{deployed_count}_type_{vnf_type}": deployment_node}
+
+        # 简单的 Tree 结构 (Source -> Current -> Dests)
+        # 注意：这里的 Tree 只是为了计费，不是真实路径
+        tree = {}
+        if source != deployment_node: tree[(source, deployment_node)] = 1.0
+        for d in dests:
+            if d != deployment_node: tree[(deployment_node, d)] = 1.0
+
+        hvt = np.zeros((self.n, self.K_vnf), dtype=np.float32)
+        hvt[deployment_node, vnf_type] = 1.0
+
+        plan = {'success': True, 'placement': placement, 'tree': tree, 'hvt': hvt}
+
+        success = False
+        try:
+            success = self.resource_mgr.apply_tree_deployment(plan, req)
+        except Exception:
+            success = False
+
+        # 3. 更新状态
+        if success:
+            self.current_tree['hvt'] += hvt
+            # 累加 tree 负载
+            for k, v in tree.items():
+                self.current_tree['tree'][k] = self.current_tree['tree'].get(k, 0) + v
+
+            if 'placement' not in self.current_tree: self.current_tree['placement'] = {}
+            self.current_tree['placement'].update(placement)
+
+            self.total_requests_accepted += 1
+
+        # 4. 奖励计算 (调用 RewardCritic)
+        cpu_val, bw_val, hops_val = 0.0, 0.0, 0
+        if success:
+            cpu_val, bw_val, hops_val = self._get_action_metrics(deployment_node, tree)
+
+        is_last_vnf = (deployed_count + 1 == len(vnf_types))
+        request_completed = success and is_last_vnf
+
+        if not success:
+            reward = self.reward_critic.criticize(request_failed=True)
+        else:
+            reward = self.reward_critic.criticize(
+                request_completed=request_completed,
+                sub_task_completed=True,
+                cpu_remain=cpu_val, bandwidth=bw_val, hops=hops_val,
+                is_meta_step=True
+            )
+
+        # 5. 流程控制
+        # 如果请求全部完成 OR 部署失败，则结束当前 Request，读取下一个
+        done = False
+        next_req = None
+
+        if request_completed or not success:
+            next_req, _ = self.reset_request()
+            # 如果没有下一个请求了，则 Episode 结束
+            if next_req is None: done = True
+
+        truncated = (self.step_counter >= self.max_steps)
+
+        info = {
+            'step': self.step_counter,
+            'success': success,
+            'action_type': 'deploy',
+            'node': deployment_node,
+            'all_deployed': request_completed
+        }
+
+        return self.get_state(), reward, done, truncated, info
+    def _execute_movement(self, current_node: int, target_node: int):
+        """执行物理移动"""
+        # 1. 物理拓扑检查
+        if hasattr(self, 'topology_mgr'):
+            neighbors = self.topology_mgr.get_neighbors(current_node)
+            neighbors.append(current_node)
+        else:
+            neighbors = list(range(self.n))
+
+        if target_node not in neighbors:
+            # 瞬移惩罚
+            info = {'error': 'teleportation', 'from': current_node, 'to': target_node}
+            return self.get_state(), -2.0, False, False, info
+
+        # 2. 更新物理位置
+        self.current_node_location = target_node
+        # 记录路径（防止画圈，用于 Feature Builder）
+        self.nodes_on_tree.add(target_node)
+
+        # 3. 计算移动奖励
+        # 移动本身有成本（-0.1），如果是原地不动（等待）且没资源，可能惩罚更多
+        reward = -0.1
+        if target_node == current_node:
+            reward = -0.2  # 鼓励移动而不是发呆
+
+        # 4. 状态更新
+        # 🔥🔥🔥 关键修复：移动并未完成任务，不要 Reset Request！🔥🔥🔥
+        done = False
+        truncated = (self.step_counter >= self.max_steps)
+        next_state = self.get_state()
+
+        # 检查是否刚到达了一个可部署点（给点小甜头？）
+        # reached_deployable = self._should_deploy_at_current_node()
+        # if reached_deployable: reward += 0.5
+
+        info = {
+            'step': self.step_counter,
+            'action_type': 'move',
+            'from': current_node,
+            'to': target_node
+        }
+
+        return next_state, reward, done, truncated, info
+    def _check_node_resource(self, node: int) -> bool:
+        """检查节点资源是否足够（用于 Mask 预判）"""
+        try:
+            if self.current_request is None: return True
+            vnf_types = self.current_request.get('vnf', [])
+            deployed = len(self.current_tree.get('placement', {}))
+            if deployed < len(vnf_types):
+                cpu = self.current_request.get('cpu_origin', [])[deployed]
+                return self.resource_mgr.C[node] >= cpu
+        except:
+            pass
+        return True
 
     # Phase 1 兼容
     @property

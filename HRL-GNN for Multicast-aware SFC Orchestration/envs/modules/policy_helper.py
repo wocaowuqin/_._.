@@ -70,10 +70,8 @@ class PolicyHelper:
 
         self.K_path = getattr(self.expert, "k_path_count", 5)
         self._expert_cache: Dict[int, Optional[Dict[str, Any]]] = {}
-
     def clear_cache(self):
         self._expert_cache.clear()
-
     # ==========================================================
     # Phase 1 ONLY —— 专家全局规划
     # ==========================================================
@@ -88,7 +86,6 @@ class PolicyHelper:
             "tree": expert_info["tree"],
             "trajectory": expert_info["trajectory"],
         }
-
     def _run_expert_if_needed(self, request, network_state):
         req_id = request['id']
         if req_id in self._expert_cache:
@@ -152,7 +149,6 @@ class PolicyHelper:
             "trajectory": trajectory
         }
         return self._expert_cache[req_id]
-
     # ==========================================================
     # Phase 2 / Phase 3 —— 执行接口
     # ==========================================================
@@ -269,11 +265,9 @@ class PolicyHelper:
             if d != target_idx:
                 candidates.append((d, 0.0))
         return candidates
-
     def expert_low_level_action(self):
         """env.expert_low_level_action 依赖此接口 (Phase1 返回无效动作)"""
         return -1
-
     # ==========================================================
     # Masks / Decoding
     # ==========================================================

@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class Phase1ExpertCollector:
-    def __init__(self, env, expert_solver, output_dir: str, max_episodes: int = 2000, save_every: int = 500):
+    def __init__(self, env, expert_solver, output_dir: str, max_episodes: int = 5000, save_every: int = 500):
         self.env = env
         self.expert = expert_solver
         self.output_dir = output_dir
