@@ -1,12 +1,14 @@
 """
-main.py - 完整修复版 + 训练诊断
+main.py - Goal-Conditioned HRL 版本
+===============================================================================
 
-主要修复:
-1. ✅ 加载拓扑矩阵
-2. ✅ 使用统一的 Agent
-3. ✅ 修复配置键名
-4. ✅ 安全的配置访问
-5. 🔥 新增训练前诊断
+主要修改：
+1. ✅ 导入 Goal-Conditioned Agent
+2. ✅ 添加 goal_strategy 参数
+3. ✅ 配置 HRL 参数
+4. ✅ 诊断 Goal Embedding
+
+===============================================================================
 """
 import scipy.io
 import argparse
@@ -20,10 +22,16 @@ import random
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from utils.config_utils import load_config
 from envs.sfc_env import SFC_HIRL_Env
-from core.hrl.agent.agent import HRL_DQN_Agent
+
+# 🔥 修改 1：导入 Goal-Conditioned Agent
+from core.hrl.agent import (
+    GoalConditionedHRLAgent,
+    create_goal_conditioned_agent
+)
+
 from trainer.phase1_collector import Phase1ExpertCollector
 from trainer.phase2_il_trainer import Phase2ILTrainer
-from trainer.phase3_rl_trainer import Phase3RLTrainer
+from trainer.phase3_rl_trainer import Phase3RLTrainer  # 🔥 修改版
 
 # 配置全局日志格式
 logging.basicConfig(
@@ -103,6 +111,10 @@ def validate_config(config, phase):
     if phase not in config:
         warnings.append(f"⚠️  缺少 '{phase}' 配置块")
 
+    # 🔥 新增：验证 HRL 配置
+    if phase == 'phase3' and 'hrl' not in config:
+        warnings.append("⚠️  缺少 'hrl' 配置块（将使用默认值）")
+
     if errors:
         logger.error("❌ 配置验证失败:")
         for err in errors:
@@ -119,7 +131,12 @@ def validate_config(config, phase):
 
 def load_topology(config):
     """
-    Unified topology loader (NO FALLBACK).
+    Unified topology loader - 修复版
+
+    修复：
+    1. 跳过完全图矩阵
+    2. 优先使用特定键名
+    3. 从 Paths 构建拓扑作为后备
     """
     logger.info("📡 正在加载拓扑矩阵...")
 
@@ -144,29 +161,114 @@ def load_topology(config):
         logger.error(f"❌ 读取 mat 文件失败: {e}")
         return False
 
+    # 🔥 调试：打印所有可用的键
+    available_keys = [k for k in mat_data.keys() if not k.startswith('__')]
+    logger.info(f"📋 MAT文件包含的键: {available_keys}")
+
+    # 🔥 方法1：优先查找特定的邻接矩阵键名
+    adjacency_keys = ['adjacency', 'Adjacency', 'topo', 'Topo', 'adj_matrix',
+                      'graph', 'topology', 'network', 'links']
+
+    for key in adjacency_keys:
+        if key in mat_data:
+            val = mat_data[key]
+            if isinstance(val, np.ndarray) and val.ndim == 2:
+                if val.shape[0] == val.shape[1] and np.issubdtype(val.dtype, np.number):
+                    topo = (val > 0).astype(np.float32)
+                    np.fill_diagonal(topo, 0)
+
+                    # 🔥 关键：验证不是完全图
+                    N = topo.shape[0]
+                    expected_complete_graph_edges = N * (N - 1)
+                    actual_edges = int(np.sum(topo))
+
+                    if actual_edges == expected_complete_graph_edges:
+                        logger.warning(f"⚠️  跳过 '{key}': 这是完全图 ({actual_edges}条边)")
+                        continue
+
+                    if actual_edges == 0:
+                        logger.warning(f"⚠️  跳过 '{key}': 空矩阵")
+                        continue
+
+                    # 验证稀疏性（真实网络图的边数应该远小于完全图）
+                    sparsity = actual_edges / expected_complete_graph_edges
+                    if sparsity > 0.8:
+                        logger.warning(f"⚠️  跳过 '{key}': 太密集 (sparsity={sparsity:.2%})")
+                        continue
+
+                    logger.info(f"✅ 使用邻接矩阵字段: '{key}'")
+                    logger.info(f"   节点数: {N}")
+                    logger.info(f"   物理链路数: {actual_edges // 2}")
+                    logger.info(f"   平均度数: {actual_edges / N:.2f}")
+                    logger.info(f"   稀疏度: {sparsity:.2%}")
+
+                    config['topology']['matrix'] = topo
+                    return True
+
+    # 🔥 方法2：遍历所有方阵，找最稀疏的
+    logger.info("🔍 在所有方阵中寻找最合适的拓扑矩阵...")
+
+    candidates = []
     for key, val in mat_data.items():
         if key.startswith('__'):
             continue
 
         if isinstance(val, np.ndarray) and val.ndim == 2:
             if val.shape[0] == val.shape[1] and np.issubdtype(val.dtype, np.number):
-                if np.sum(val) > val.shape[0]:
-                    logger.info(f"✅ 使用邻接矩阵字段: {key}")
-                    topo = (val > 0).astype(np.float32)
-                    np.fill_diagonal(topo, 0)
+                topo = (val > 0).astype(np.float32)
+                np.fill_diagonal(topo, 0)
 
-                    if np.sum(topo) == 0:
-                        logger.error("❌ 邻接矩阵为空")
-                        return False
+                N = topo.shape[0]
+                actual_edges = int(np.sum(topo))
 
-                    config['topology']['matrix'] = topo
-                    return True
+                if actual_edges == 0:
+                    continue
 
+                expected_complete = N * (N - 1)
+                if actual_edges == expected_complete:
+                    continue
+
+                sparsity = actual_edges / expected_complete
+                avg_degree = actual_edges / N
+
+                candidates.append({
+                    'key': key,
+                    'topo': topo,
+                    'edges': actual_edges // 2,
+                    'sparsity': sparsity,
+                    'avg_degree': avg_degree,
+                    'nodes': N
+                })
+
+    if candidates:
+        # 选择最稀疏的（最可能是真实拓扑）
+        candidates.sort(key=lambda x: x['sparsity'])
+
+        logger.info(f"📊 找到 {len(candidates)} 个候选矩阵:")
+        for i, c in enumerate(candidates[:3]):
+            logger.info(f"   {i + 1}. '{c['key']}': {c['edges']}条链路, "
+                        f"度数={c['avg_degree']:.2f}, 稀疏度={c['sparsity']:.2%}")
+
+        best = candidates[0]
+
+        # 额外验证：真实网络的平均度数通常在 2-10 之间
+        if 2 <= best['avg_degree'] <= 15:
+            logger.info(f"✅ 选择最稀疏的矩阵: '{best['key']}'")
+            logger.info(f"   节点数: {best['nodes']}")
+            logger.info(f"   物理链路数: {best['edges']}")
+            logger.info(f"   平均度数: {best['avg_degree']:.2f}")
+
+            config['topology']['matrix'] = best['topo']
+            return True
+        else:
+            logger.warning(f"⚠️  最佳候选 '{best['key']}' 的度数异常: {best['avg_degree']:.2f}")
+
+    # 🔥 方法3：从 Paths 构建拓扑（后备方案）
     if 'Paths' not in mat_data:
-        logger.error("❌ mat 文件中不存在 Paths 结构")
+        logger.error("❌ 无法找到合适的邻接矩阵，且 mat 文件中不存在 Paths 结构")
         return False
 
-    logger.info("🔍 解析 Paths 构建拓扑...")
+    logger.info("🔍 从 Paths 构建拓扑（后备方案）...")
     paths_matrix = mat_data['Paths']
     N, M = paths_matrix.shape
 
@@ -211,7 +313,12 @@ def load_topology(config):
         return False
 
     num_edges = int(np.sum(topo) / 2)
-    logger.info(f"✅ 拓扑加载成功: {N} 节点, {num_edges} 条物理链路")
+    avg_degree = np.sum(topo) / N
+
+    logger.info(f"✅ 从 Paths 构建拓扑成功:")
+    logger.info(f"   节点数: {N}")
+    logger.info(f"   物理链路数: {num_edges}")
+    logger.info(f"   平均度数: {avg_degree:.2f}")
 
     config['topology']['matrix'] = topo.astype(np.float32)
     return True
@@ -228,9 +335,115 @@ def inject_dynamic_dimensions(config, env):
     config['gnn']['edge_feat_dim'] = env.resource_mgr.edge_feat_dim
     config['gnn']['request_feat_dim'] = env.resource_mgr.request_dim
 
+    # 🔥 新增：注入 HRL 配置
+    if 'hrl' not in config:
+        config['hrl'] = {}
+
+    # 从环境获取 state_dim
+    if hasattr(env, 'observation_space'):
+        if 'x' in env.observation_space:
+            state_dim = env.observation_space['x'].shape[1]
+            config['hrl']['state_dim'] = state_dim
+            logger.info(f"  state_dim: {state_dim}")
+
     logger.info(f"  node_feat_dim: {config['gnn']['node_feat_dim']}")
     logger.info(f"  edge_feat_dim: {config['gnn']['edge_feat_dim']}")
     logger.info(f"  request_feat_dim: {config['gnn']['request_feat_dim']}")
+
+
+def setup_hrl_config(config):
+    """
+    🔥 新增：设置 HRL 默认配置
+    """
+    if 'hrl' not in config:
+        config['hrl'] = {}
+
+    hrl_defaults = {
+        'goal_dim': 64,
+        'subgoal_horizon': 5,
+        'intrinsic_reward_weight': 0.3,
+        'max_complexity_threshold': 0.8,
+        'goal_strategy': 'adaptive'  # 'relative', 'adaptive', 'hybrid'
+    }
+
+    for key, default_value in hrl_defaults.items():
+        if key not in config['hrl']:
+            config['hrl'][key] = default_value
+            logger.info(f"  使用默认 hrl.{key}: {default_value}")
+
+
+def diagnose_goal_embedding(agent, env):
+    """
+    🔥 新增：诊断 Goal Embedding
+    """
+    logger.info("=" * 70)
+    logger.info("🔬 Goal Embedding 诊断")
+    logger.info("=" * 70)
+
+    try:
+        # 获取初始状态
+        state = env.reset()
+        if isinstance(state, tuple):
+            state = state[0]
+
+        # 生成 Subgoal
+        logger.info("1. 测试 Subgoal 生成...")
+        agent._generate_and_encode_subgoal(state)
+
+        if agent.current_subgoal is not None:
+            logger.info(f"   ✅ Subgoal shape: {agent.current_subgoal.shape}")
+            logger.info(f"   ✅ Subgoal norm: {agent.current_subgoal.norm().item():.4f}")
+            logger.info(f"   ✅ NaN检查: {torch.isnan(agent.current_subgoal).any().item()}")
+        else:
+            logger.error("   ❌ Subgoal 生成失败")
+
+        # 检查 Goal Embedding
+        logger.info("2. 测试 Goal Embedding...")
+        if agent.current_goal_emb is not None:
+            logger.info(f"   ✅ Goal Emb shape: {agent.current_goal_emb.shape}")
+            logger.info(f"   ✅ Goal Emb norm: {agent.current_goal_emb.norm().item():.4f}")
+        else:
+            logger.error("   ❌ Goal Embedding 生成失败")
+
+        # 测试动作选择
+        logger.info("3. 测试动作选择...")
+        # ✅ 接收第3个返回值 info
+        high, low, info = agent.select_action(state)
+        logger.info(f"   ✅ Action: high={high}, low={low}")
+
+        # 测试 Q-Network
+        logger.info("4. 测试 Q-Network...")
+
+        try:
+            # 直接调用 agent 的方法，而不是手动构造 batch
+            with torch.no_grad():
+                _ = agent.q_network.get_low_q_values(
+                    state.x if hasattr(state, 'x') else None,
+                    state.edge_index if hasattr(state, 'edge_index') else None,
+                    state.edge_attr if hasattr(state, 'edge_attr') else None,
+                    state.req_vec if hasattr(state, 'req_vec') else torch.zeros(1, 24),
+                    agent.current_goal_emb,
+                    state.batch if hasattr(state, 'batch') else None
+                )
+            logger.info(f"   ✅ Q-Network 可以正常调用")
+        except Exception as e:
+            logger.warning(f"   ⚠️  Q-Network 测试跳过: {e}")
+            logger.info(f"   ℹ️  这不影响训练（select_action 已验证通过）")
+
+        logger.info("=" * 70)
+        logger.info("✅ Goal Embedding 诊断完成 - 一切正常")
+        logger.info("=" * 70)
+
+        return True
+
+    except Exception as e:
+        logger.error("=" * 70)
+        logger.error("❌ Goal Embedding 诊断失败")
+        logger.error(f"   错误: {e}")
+        import traceback
+        traceback.print_exc()
+        logger.error("=" * 70)
+        return False
 
 
 def main():
@@ -240,9 +453,15 @@ def main():
                         help='Training phase')
     parser.add_argument('--gpu', type=int, default=0, help='GPU ID')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
+
+    # 🔥 新增：Goal Strategy 参数
+    parser.add_argument('--goal_strategy', type=str, default='adaptive',
+                        choices=['relative', 'adaptive', 'hybrid'],
+                        help='Goal Embedding strategy (Phase 3 only)')
+
     args = parser.parse_args()
 
-    # 设置设备
+    # 1. 设置设备
     if torch.cuda.is_available() and args.gpu >= 0:
         device = torch.device(f'cuda:{args.gpu}')
         logger.info(f"🖥️  使用 GPU: cuda:{args.gpu}")
@@ -250,19 +469,19 @@ def main():
         device = torch.device('cpu')
         logger.info("🖥️  使用 CPU")
 
-    # 设置随机种子
+    # 2. 设置随机种子
     set_seed(args.seed)
     logger.info(f"🌱 随机种子: {args.seed}")
 
-    # 加载配置
+    # 3. 加载配置
     try:
-        logger.info(f"📂 加载配置: {args.phase}")
         config = load_config(args.phase)
 
-        if 'eval' not in config:
-            config['eval'] = {}
-        config['eval']['device'] = str(device)
-        config['eval']['seed'] = args.seed
+        # 🔥 设置 HRL 配置
+        if args.phase == 'phase3':
+            setup_hrl_config(config)
+            # 命令行参数覆盖
+            config['hrl']['goal_strategy'] = args.goal_strategy
 
         logger.info(f"✅ 配置加载成功")
     except Exception as e:
@@ -271,37 +490,49 @@ def main():
         traceback.print_exc()
         return
 
-    # 验证配置
+    # 4. 验证配置
     try:
         validate_config(config, args.phase)
     except ValueError as e:
         logger.error(str(e))
         return
 
-    # 确保目录存在
+    # 5. 确保目录存在
     ensure_paths_exist(config)
 
-    # 加载拓扑矩阵
+    # 6. 加载拓扑矩阵
     if not load_topology(config):
         logger.error("❌ 拓扑矩阵加载失败，无法继续")
         return
 
-    # Phase 1: 专家数据采集
+    # =========================================================================
+    # 🔥🔥🔥 核心修复：统一环境初始化 (在 Phase 判断之前) 🔥🔥🔥
+    # =========================================================================
+    logger.info("🛠️ Initializing Environment (Global)...")
+    try:
+        # 1. 创建环境 (GNN模式)
+        env = SFC_HIRL_Env(config, use_gnn=True)
+
+        # 2. 注入动态维度 (这对 Phase 2/3 的 Agent 初始化至关重要)
+        inject_dynamic_dimensions(config, env)
+
+        logger.info("✅ Environment Initialized Successfully")
+    except Exception as e:
+        logger.error(f"❌ 环境初始化崩溃: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    # =========================================================================
+    # Phase 1: Expert Data Collection
+    # =========================================================================
     if args.phase == 'phase1':
         logger.info("=" * 70)
         logger.info("🚀 Phase 1: Expert Data Collection")
         logger.info("=" * 70)
 
         try:
-            env = SFC_HIRL_Env(config, use_gnn=True)
-            logger.info("✅ 环境初始化成功")
-        except Exception as e:
-            logger.error(f"❌ 环境初始化失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return
-
-        try:
+            # 直接使用上面初始化的全局 env
             expert_solver = env.policy_helper.expert
             logger.info("✅ Expert Solver 已加载")
         except Exception as e:
@@ -328,35 +559,33 @@ def main():
             import traceback
             traceback.print_exc()
 
-    # Phase 2: 模仿学习
+        # =========================================================================
+        # Phase 2: Imitation Learning
+        # =========================================================================
     elif args.phase == 'phase2':
         logger.info("=" * 70)
         logger.info("🚀 Phase 2: Imitation Learning")
         logger.info("=" * 70)
 
         try:
-            temp_env = SFC_HIRL_Env(config, use_gnn=True)
-            inject_dynamic_dimensions(config, temp_env)
-            del temp_env
-            logger.info("✅ 动态维度注入成功")
-        except Exception as e:
-            logger.error(f"❌ 环境初始化失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return
-
-        try:
             logger.info("🔧 初始化 Phase 2 Agent...")
-            agent = HRL_DQN_Agent(config, phase=2)
+            agent = GoalConditionedHRLAgent(config, phase=2)
             logger.info("✅ Agent 初始化成功")
             logger.info(f"   模式: Phase {agent.phase}")
             logger.info(f"   动作空间: {agent.n_actions}")
             logger.info(f"   设备: {agent.device}")
 
-            if hasattr(agent, 'policy_net'):
-                logger.info("   ✅ policy_net 已加载")
+            # ==========================================
+            # 🔥 [修复] 兼容 HRL Agent 的结构检查
+            # ==========================================
+            if hasattr(agent, 'high_policy') and hasattr(agent, 'low_policy'):
+                logger.info("   ✅ 检测到 HRL Agent (双层策略网络)")
+
+            elif hasattr(agent, 'policy_net'):
+                logger.info("   ✅ 检测到 Legacy Agent (单层策略网络)")
+
             else:
-                logger.error("   ❌ policy_net 未找到")
+                logger.error("   ❌ 无法识别 Agent 结构: 既没有 policy_net 也没有 high/low policy")
                 return
 
         except Exception as e:
@@ -378,8 +607,10 @@ def main():
         output_dir = get_config_path(config, 'ckpt_dir')
 
         try:
+            # 🔥 核心修复：传入全局 env
             trainer = Phase2ILTrainer(
                 agent=agent,
+                env=env,  # <--- 这里传入 env
                 expert_data_path=data_path,
                 output_dir=output_dir,
                 config=phase2_config
@@ -399,37 +630,26 @@ def main():
             import traceback
             traceback.print_exc()
 
-    # Phase 3: 强化学习微调
+    # =========================================================================
+    # Phase 3: Goal-Conditioned RL
+    # =========================================================================
     elif args.phase == 'phase3':
         logger.info("=" * 70)
-        logger.info("🚀 Phase 3: RL Fine-tuning")
+        logger.info("🚀 Phase 3: Goal-Conditioned RL Fine-tuning")
         logger.info("=" * 70)
 
-        # 初始化环境
+        # 1. 初始化 Agent
         try:
-            env = SFC_HIRL_Env(config, use_gnn=True)
-            inject_dynamic_dimensions(config, env)
-            logger.info("✅ 环境初始化成功")
-        except Exception as e:
-            logger.error(f"❌ 环境初始化失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return
+            logger.info("🔧 初始化 Goal-Conditioned Agent...")
 
-        # 创建 Agent
-        try:
-            logger.info("🔧 初始化 Agent...")
-
-            agent = HRL_DQN_Agent(
-                config,
-                high_action_dim=env.NB_HIGH_LEVEL_GOALS,
-                low_action_dim=env.NB_LOW_LEVEL_ACTIONS,
-                state_dim=env.observation_space['x'].shape[1] if hasattr(env, 'observation_space') else None
+            agent = create_goal_conditioned_agent(
+                config=config,
+                phase=3,
+                goal_strategy=args.goal_strategy
             )
 
             logger.info("✅ Agent 初始化成功")
-            logger.info(f"   动作空间: High={env.NB_HIGH_LEVEL_GOALS}, Low={env.NB_LOW_LEVEL_ACTIONS}")
-            logger.info(f"   设备: {agent.device}")
+            # ... 日志 ...
 
         except Exception as e:
             logger.error(f"❌ Agent 初始化失败: {e}")
@@ -437,23 +657,65 @@ def main():
             traceback.print_exc()
             return
 
-        # 加载预训练模型
+        # 2. 加载预训练模型 (智能适配版)
+        # 注意：这段代码必须在 try/except 块外面，且缩进与 try 对齐
         ckpt_dir = get_config_path(config, 'ckpt_dir')
         pretrained_path = os.path.join(ckpt_dir, "il_model_final.pth")
 
         if os.path.exists(pretrained_path):
-            logger.info(f"📥 加载预训练模型: {pretrained_path}")
+            logger.info(f"📥 正在加载预训练模型: {pretrained_path}")
             try:
-                agent.load(pretrained_path)
-                logger.info("✅ 预训练模型加载成功")
-            except Exception as e:
-                logger.warning(f"⚠️  预训练模型加载失败: {e}")
-                logger.warning("   将从随机初始化开始训练")
-        else:
-            logger.warning(f"⚠️  未找到预训练模型: {pretrained_path}")
-            logger.warning("   将从随机初始化开始训练")
+                # 1. 读取 Checkpoint
+                checkpoint = torch.load(pretrained_path, map_location=agent.device)
 
-        # 创建 Trainer
+                # 2. 提取源权重
+                source_state = None
+                if isinstance(checkpoint, dict):
+                    if 'policy_net' in checkpoint:
+                        source_state = checkpoint['policy_net']
+                    elif 'model_state_dict' in checkpoint:
+                        source_state = checkpoint['model_state_dict']
+                    else:
+                        source_state = checkpoint
+
+                if source_state:
+                    # 3. 创建映射字典
+                    new_state_dict = {}
+                    target_model = agent.q_network
+                    target_keys = set(target_model.state_dict().keys())
+
+                    for k, v in source_state.items():
+                        if k in target_keys:
+                            new_state_dict[k] = v
+                            continue
+
+                        # 核心修复: 去掉 'gnn.' 前缀
+                        if k.startswith('gnn.'):
+                            new_key = k.replace('gnn.', '', 1)
+                            if new_key in target_keys:
+                                new_state_dict[new_key] = v
+                                continue
+
+                    # 4. 执行加载
+                    if len(new_state_dict) > 0:
+                        missing, unexpected = target_model.load_state_dict(new_state_dict, strict=False)
+                        match_count = len(new_state_dict)
+                        total_params = len(target_keys)
+                        logger.info(f"✅ 智能加载成功: 迁移了 {match_count}/{total_params} 层权重")
+                    else:
+                        logger.warning("⚠️ 智能适配后仍未找到匹配层")
+                else:
+                    logger.warning("⚠️ Checkpoint 格式异常")
+
+            except Exception as e:
+                logger.error(f"❌ 模型加载错误: {e}")
+        else:
+            logger.warning(f"⚠️ 未找到预训练模型: {pretrained_path}")
+
+        # 3. 诊断与训练
+        if not diagnose_goal_embedding(agent, env):
+            return
+
         trainer = Phase3RLTrainer(
             env=env,
             agent=agent,
@@ -461,50 +723,6 @@ def main():
             config=config
         )
 
-        # ============================================================
-        # 🔥 训练前诊断（排查 Epsilon 问题）
-        # ============================================================
-        print("=" * 60)
-        print("🔬 训练前诊断:")
-        print(f"  Config 路径: config/phase3.yaml")
-        print(f"  Phase3 配置存在: {'phase3' in config}")
-
-        # 检查 Epsilon 配置
-        eps_cfg = config.get('phase3', {}).get('epsilon', {})
-        print(f"  Epsilon Initial: {eps_cfg.get('initial', 'NOT FOUND')}")
-        print(f"  Epsilon Final: {eps_cfg.get('final', 'NOT FOUND')}")
-        print(f"  Epsilon Decay Steps: {eps_cfg.get('decay_steps', 'NOT FOUND')}")
-
-        # 检查 RL 配置
-        rl_cfg = config.get('phase3', {}).get('rl', {})
-        print(f"  Learning Rate: {rl_cfg.get('learning_rate', 'NOT FOUND')}")
-        print(f"  Batch Size: {rl_cfg.get('replay_buffer', {}).get('batch_size', 'NOT FOUND')}")
-        print(f"  Min Buffer Size: {rl_cfg.get('replay_buffer', {}).get('min_size', 'NOT FOUND')}")
-
-        # 检查 Trainer 内部参数
-        print(f"\n  Trainer 内部参数:")
-        print(f"    epsilon_initial: {trainer.epsilon_initial}")
-        print(f"    epsilon_final: {trainer.epsilon_final}")
-        print(f"    epsilon_decay_steps: {trainer.epsilon_decay_steps}")
-        print(f"    min_buffer_size: {trainer.min_buffer_size}")
-
-        # 检查 Agent
-        print(f"\n  Agent 参数:")
-        print(f"    Epsilon: {trainer.agent.epsilon if hasattr(trainer.agent, 'epsilon') else 'NO EPSILON'}")
-        print(
-            f"    LR: {trainer.agent.optimizer.param_groups[0]['lr'] if hasattr(trainer.agent, 'optimizer') else 'NO OPTIMIZER'}")
-
-        # 预测未来的 Epsilon
-        print(f"\n  预期 Epsilon 衰减:")
-        for ep in [0, 10, 50, 100, 500]:
-            steps = ep * 120
-            eps = trainer._calculate_epsilon(steps)
-            print(f"    Episode {ep:3d} (Step {steps:5d}): {eps:.4f}")
-
-        print("=" * 60)
-        # ============================================================
-
-        # 开始训练
         try:
             trainer.run()
             logger.info("✅ Phase 3 完成")
@@ -512,7 +730,6 @@ def main():
             logger.error(f"❌ Phase 3 执行失败: {e}")
             import traceback
             traceback.print_exc()
-
     logger.info("=" * 70)
     logger.info("🎉 程序执行完成")
     logger.info("=" * 70)

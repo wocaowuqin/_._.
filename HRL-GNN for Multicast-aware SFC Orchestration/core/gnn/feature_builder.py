@@ -1,127 +1,148 @@
-# core/gnn/feature_builder.py
+"""
+core/gnn/feature_builder.py
+GNN 特征构建器 - 最终修复版 (Fix Batch Collision & Req Dim)
+"""
+
 import torch
-import numpy as np
-from torch_geometric.data import Data, Batch
 import logging
+from torch_geometric.data import Batch, Data
 
 logger = logging.getLogger(__name__)
 
-
 class GNNFeatureBuilder:
-    """
-    GNN 特征处理器
-    负责将 Environment 产出的单个状态数据，转换为模型可接受的 Batch 数据。
-    """
-
     def __init__(self, device):
         self.device = device
 
-    def to_pyg_data(self, state):
-        """
-        将 Env 返回的 Tuple 状态转换为 PyG 的 Data 对象
-        State 格式: (x, edge_index, edge_attr, req_vec)
-        """
-        # 兼容性处理：如果 state 已经是 PyG Data，直接返回
-        if hasattr(state, 'edge_index') and hasattr(state, 'x'):
-            return state
+    def get_state_dim(self):
+        return 32
 
-        x, edge_index, edge_attr, req_vec = state
+    def _try_assemble_tuple(self, obj):
+        """处理 (x, edge_index, edge_attr, req_vec) 元组"""
+        if isinstance(obj, (tuple, list)) and len(obj) == 4:
+            t0, t1, t2, t3 = obj[0], obj[1], obj[2], obj[3]
+            if (torch.is_tensor(t0) and torch.is_tensor(t1) and
+                torch.is_tensor(t2) and torch.is_tensor(t3)):
 
-        # 确保是 Tensor
-        if not isinstance(x, torch.Tensor):
-            x = torch.tensor(x, dtype=torch.float32)
-        if not isinstance(edge_index, torch.Tensor):
-            edge_index = torch.tensor(edge_index, dtype=torch.long)
-        if not isinstance(edge_attr, torch.Tensor):
-            edge_attr = torch.tensor(edge_attr, dtype=torch.float32)
-        if not isinstance(req_vec, torch.Tensor):
-            req_vec = torch.tensor(req_vec, dtype=torch.float32)
+                if t1.dim() == 2 and t1.shape[0] == 2:
+                    req_v = t3.cpu()
+                    if req_v.dim() == 1:
+                        req_v = req_v.unsqueeze(0)
 
-        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
-        data.req_vec = req_vec.unsqueeze(0)  # [1, D]
+                    return Data(
+                        x=t0.cpu(),
+                        edge_index=t1.cpu().long(),
+                        edge_attr=t2.cpu(),
+                        req_vec=req_v
+                    )
+        return None
 
-        return data
+    def _extract_data(self, obj, depth=0):
+        """提取并清洗 Data 对象 (关键修复：移除残留的 batch 属性)"""
+        if depth > 3: return None
 
-    def collate_fn(self, batch_data):
-        """
-        核心功能：将多个 transition 样本打包成 Batch
-        支持输入为 dict (Agent存的) 或 tuple
-        """
-        batch_states = []
-        batch_actions_high = []
-        batch_actions_low = []
-        batch_rewards = []
-        batch_next_states = []
-        batch_dones = []
-        batch_masks = []
+        # 检查是否是 Data 对象 (或类似结构)
+        if hasattr(obj, 'x') and hasattr(obj, 'edge_index'):
 
-        for item in batch_data:
-            # 🔥 修复：支持字典类型的 Transition
-            if isinstance(item, dict):
-                state = item['state']
-                action = item['action']
-                reward = item['reward']
-                next_state = item['next_state']
-                done = item['done']
-                masks = item.get('next_valid_mask')  # 可能为 None
-            else:
-                # 旧的 Tuple 解包方式 (保留兼容性)
+            # 🔥 核心修复 1: 移除残留的 batch 属性
+            # 防止在 Batch.from_data_list 时发生 Key 冲突
+            if hasattr(obj, 'batch') and obj.batch is not None:
+                del obj.batch
+
+            # 处理 Batch 对象封装的情况
+            if hasattr(obj, 'to_data_list'):
                 try:
-                    state, action, reward, next_state, done, masks = item
-                except ValueError:
-                    # 如果 tuple 长度不对，尝试忽略 masks
-                    state, action, reward, next_state, done = item[:5]
-                    masks = None
+                    data = obj.to_data_list()[0]
+                    # 再次清洗提取出的对象
+                    if hasattr(data, 'batch'): del data.batch
 
-            # 1. 处理状态
-            batch_states.append(self.to_pyg_data(state))
-            batch_next_states.append(self.to_pyg_data(next_state))
+                    if hasattr(data, 'req_vec') and data.req_vec.dim() == 1:
+                        data.req_vec = data.req_vec.unsqueeze(0)
+                    return data
+                except:
+                    pass
 
-            # 2. 处理动作
-            if isinstance(action, (tuple, list, np.ndarray)):
-                high_act, low_act = action
-            else:
-                high_act, low_act = 0, action  # fallback
+            # ✅ 核心修复 2: 维度修正
+            if hasattr(obj, 'req_vec') and obj.req_vec.dim() == 1:
+                obj.req_vec = obj.req_vec.unsqueeze(0)
 
-            batch_actions_high.append(high_act)
-            batch_actions_low.append(low_act)
-            batch_rewards.append(reward)
-            batch_dones.append(done)
-            batch_masks.append(masks)
+            return obj
 
-        # === Batch 拼接 ===
-        batched_state = Batch.from_data_list(batch_states).to(self.device)
-        batched_next_state = Batch.from_data_list(batch_next_states).to(self.device)
+        # 尝试递归查找
+        assembled = self._try_assemble_tuple(obj)
+        if assembled is not None: return assembled
 
-        # 拼接全局特征 req_vec [B, D]
-        if hasattr(batch_states[0], 'req_vec'):
-            batched_state.req_vec = torch.cat([d.req_vec for d in batch_states], dim=0).to(self.device)
+        if isinstance(obj, (tuple, list)):
+            for item in obj:
+                res = self._extract_data(item, depth + 1)
+                if res is not None: return res
 
-        if hasattr(batch_next_states[0], 'req_vec'):
-            batched_next_state.req_vec = torch.cat([d.req_vec for d in batch_next_states], dim=0).to(self.device)
+        return None
 
-        # 转换为 Tensor
-        actions_high = torch.tensor(batch_actions_high, dtype=torch.long, device=self.device)
-        actions_low = torch.tensor(batch_actions_low, dtype=torch.long, device=self.device)
-        rewards = torch.tensor(batch_rewards, dtype=torch.float32, device=self.device).unsqueeze(1)
-        dones = torch.tensor(batch_dones, dtype=torch.float32, device=self.device).unsqueeze(1)
-
-        # Mask 处理
-        # 如果 batch_masks 中有 None，我们需要构造全 1 Mask 防止报错
-        if any(m is None for m in batch_masks):
-            # 构造默认 Mask (假设 mask 全为 1)
-            # 注意：这里无法动态获取 dim，只能尽力防御
-            masks_high = None
-            masks_low = None
-        else:
-            masks_high = torch.tensor(np.array([m[0] for m in batch_masks]), dtype=torch.float32, device=self.device)
-            masks_low = torch.tensor(np.array([m[1] for m in batch_masks]), dtype=torch.float32, device=self.device)
-
-        return {
-            'state': batched_state,
-            'next_state': batched_next_state,
-            'action': (actions_high, actions_low),
-            'reward': rewards,
-            'done': dones,
-            'mask': (masks_high, masks_low)  # 可能包含 None
+    def collate_fn(self, transitions):
+        batch = {
+            'state': [], 'next_state': [], 'action': [],
+            'reward': [], 'done': [], 'goal_emb': []
         }
+
+        for i, t in enumerate(transitions):
+            # _extract_data 现在会自动清洗 'batch' 属性
+            s = self._extract_data(t['state'])
+            if s is None: raise ValueError(f"Transition {i} state invalid")
+            batch['state'].append(s)
+
+            ns = self._extract_data(t['next_state'])
+            if ns is None: raise ValueError(f"Transition {i} next_state invalid")
+            batch['next_state'].append(ns)
+
+            batch['action'].append(t['action'])
+            batch['reward'].append(t['reward'])
+            batch['done'].append(t['done'])
+
+            if 'goal_emb' in t:
+                g = t['goal_emb']
+                if isinstance(g, torch.Tensor) and g.dim() == 1:
+                    g = g.unsqueeze(0)
+                batch['goal_emb'].append(g)
+
+        try:
+            # PyG Batch 组装 (现在输入是干净的 Data 对象，不会报错了)
+            batch['state'] = Batch.from_data_list(batch['state']).to(self.device)
+            batch['next_state'] = Batch.from_data_list(batch['next_state']).to(self.device)
+
+            batch['action'] = torch.tensor(batch['action'], dtype=torch.long, device=self.device)
+            batch['reward'] = torch.tensor(batch['reward'], dtype=torch.float32, device=self.device).unsqueeze(1)
+            batch['done'] = torch.tensor(batch['done'], dtype=torch.float32, device=self.device).unsqueeze(1)
+
+            raw_goals = batch.get('goal_emb', [])
+            valid_goals = [g for g in raw_goals if g is not None]
+            if len(valid_goals) > 0:
+                if isinstance(valid_goals[0], torch.Tensor):
+                    batch['goal_emb'] = torch.cat(valid_goals, dim=0).to(self.device)
+                else:
+                    batch['goal_emb'] = torch.tensor(valid_goals, dtype=torch.float32, device=self.device)
+            else:
+                batch['goal_emb'] = None
+
+            return batch
+
+        except Exception as e:
+            logger.error(f"❌ Batch Assembly Failed: {e}")
+            raise e
+
+    def state_to_batch(self, states):
+        if not isinstance(states, list): states = [states]
+        clean_states = []
+        for s in states:
+            clean = self._extract_data(s)
+            if clean: clean_states.append(clean)
+
+        if not clean_states: raise ValueError("state_to_batch failed")
+
+        if len(clean_states) == 1:
+            data = clean_states[0]
+            # 推断时，如果没有 batch 属性，需要加上
+            if not hasattr(data, 'batch') or data.batch is None:
+                data.batch = torch.zeros(data.x.size(0), dtype=torch.long, device=self.device)
+            return data.to(self.device)
+        else:
+            return Batch.from_data_list(clean_states).to(self.device)

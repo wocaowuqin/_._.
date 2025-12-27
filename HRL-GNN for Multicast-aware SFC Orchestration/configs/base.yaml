@@ -47,7 +47,7 @@ environment:
   use_gnn: true
   nb_high_level_goals: 10
   nb_low_level_actions: 28
-
+  max_steps_per_episode: 200
 # 6. 评估配置
 eval:
   device: 'cpu'

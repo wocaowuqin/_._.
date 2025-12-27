@@ -1,192 +1,285 @@
-#!/usr/bin/env python3
-"""监控 Phase 2 训练过程 (修复维度匹配版)"""
+"""
+深度诊断：为什么最多只能连接4/5个目的节点？
+分析树构建阶段的具体问题
+"""
 
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-import pickle
-import numpy as np
-from pathlib import Path
-
-# 增加项目路径搜索
 import sys
-import os
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-print("=" * 70)
-print("🔍 Phase 2 训练过程监控 (Fixed)")
-print("=" * 70)
-
-# ============================================
-# 1. 加载配置和模型
-# ============================================
-print("\n📊 Step 1: 加载模型")
+sys.path.append('.')
 
 from utils.config_utils import load_config
 from envs.sfc_env import SFC_HIRL_Env
-from core.hrl.agent.agent import HRL_DQN_Agent
+import numpy as np
+from collections import defaultdict
 
-# 1. 加载基础配置
-config = load_config('phase2')
+def analyze_tree_building_failure():
+    print("=" * 80)
+    print("树构建失败深度诊断")
+    print("=" * 80)
 
-# 2. 初始化环境
-env = SFC_HIRL_Env(config, use_gnn=True)
+    config = load_config('phase3')
+    env = SFC_HIRL_Env(config, use_gnn=True)
 
-# 🔥 核心修复：将环境的真实维度注入配置 🔥
-print("🔧 正在同步环境维度到配置...")
-if 'gnn' not in config: config['gnn'] = {}
+    # 运行多个Episode，收集失败模式
+    failure_patterns = []
 
-# 获取环境中的特征维度
-node_dim = env.resource_mgr.node_feat_dim
-edge_dim = env.resource_mgr.edge_feat_dim
-req_dim = env.resource_mgr.request_dim
+    for ep in range(10):
+        state = env.reset()
+        if isinstance(state, tuple):
+            state = state[0]
 
-# 覆盖配置
-config['gnn']['node_feat_dim'] = node_dim
-config['gnn']['edge_feat_dim'] = edge_dim
-config['gnn']['request_feat_dim'] = req_dim
-# 兼容旧键名
-config['gnn']['node_feat'] = node_dim
-config['gnn']['edge_feat'] = edge_dim
-config['gnn']['req'] = req_dim
+        req = env.current_request
+        src = req.get('source', -1)
+        dests = req.get('dest', [])
+        vnfs = req.get('vnf', [])
 
-print(f"   ✅ Node Dim: {node_dim}")
-print(f"   ✅ Edge Dim: {edge_dim}")
-print(f"   ✅ Req  Dim: {req_dim}")
+        print(f"\n{'='*80}")
+        print(f"Episode {ep}")
+        print(f"Source: {src}, Dests: {dests}, VNFs: {vnfs}")
+        print('='*80)
 
-# 3. 初始化 Agent (现在它会使用正确的 17 维输入层)
-agent = HRL_DQN_Agent(
-    config,
-    high_action_dim=env.NB_HIGH_LEVEL_GOALS,
-    low_action_dim=env.NB_LOW_LEVEL_ACTIONS,
-    phase=2
-)
+        # 先完成VNF部署
+        step = 0
+        deployed = 0
+        current_node = src
 
-# 强制模型进入评估模式
-agent.policy_net.eval()
-print(f"✅ 模型加载成功 (输入层已修正为 {node_dim})")
+        while deployed < len(vnfs) and step < 20:
+            step += 1
+            mask = env.get_low_level_action_mask()
+            valid_actions = np.where(mask)[0]
 
-# ============================================
-# 2. 加载数据
-# ============================================
-print("\n📊 Step 2: 加载数据")
+            deployed_count = len(env.current_tree.get('placement', {}))
 
-data_path = Path("outputs/expert/expert_data_final.pkl")
-if not data_path.exists():
-    # 尝试备用路径
-    data_path = Path("outputs/expert/expert_transitions_fixed.pkl")
+            if current_node in valid_actions:
+                can_deploy = env._check_deployment_validity(current_node)
+                if can_deploy and current_node in env.dc_nodes:
+                    env.step_high_level(0)
+                    env.step_low_level(current_node)
+                    new_deployed = len(env.current_tree.get('placement', {}))
+                    if new_deployed > deployed_count:
+                        deployed = new_deployed
+                        print(f"  ✅ VNF#{deployed-1} 部署在节点{current_node}")
+                    continue
 
-if not data_path.exists():
-    print(f"❌ 数据文件不存在: {data_path}")
-    exit(1)
+            # 移动到DC
+            dc_options = [n for n in valid_actions if n in env.dc_nodes]
+            if dc_options:
+                next_node = dc_options[0]
+                env.step_high_level(0)
+                env.step_low_level(next_node)
+                current_node = env.current_node_location
 
-with open(data_path, 'rb') as f:
-    data = pickle.load(f)
-
-# 兼容不同的保存格式
-if isinstance(data, list):
-    transitions = data
-    print(f"  识别为 List 格式, 数量: {len(transitions)}")
-elif isinstance(data, dict):
-    transitions = data.get('success', [])
-    print(f"  识别为 Dict 格式, 'success' 数量: {len(transitions)}")
-else:
-    transitions = []
-
-# 转换为单步数据
-samples = []
-for trans in transitions:
-    # 情况 A: 已经是处理好的 Transition (fix_data.py 生成的)
-    if 'state' in trans and isinstance(trans.get('action'), (int, np.integer)):
-        samples.append(trans)
-        continue
-
-    # 情况 B: 原始 Phase 1 路径数据
-    action_data = trans.get('action')
-    state = trans.get('state')
-
-    if not isinstance(action_data, dict):
-        continue
-
-    path = action_data.get('path', [])
-    if len(path) <= 1:
-        continue
-
-    # 提取每一步
-    for i in range(1, len(path)):
-        node = int(path[i]) if isinstance(path[i], np.integer) else path[i]
-
-        # 简单校验
-        if node < 0 or node >= 28:
+        if deployed < len(vnfs):
+            print(f"  ❌ VNF部署失败: {deployed}/{len(vnfs)}")
             continue
 
-        samples.append({
-            'state': state,
-            'action': node,
-            'reward': 10.0
-        })
+        print(f"  ✅ VNF部署完成: {deployed}/{len(vnfs)}")
 
-print(f"  可用单步样本数: {len(samples)}")
+        # 树构建阶段诊断
+        print(f"\n  【树构建阶段诊断】")
 
-if len(samples) == 0:
-    print("❌ 没有有效样本，请检查数据文件！")
-    exit(1)
+        connected_dests = set()
+        tree_edges = []
+        step = 0
+        max_tree_steps = 50
 
-# ============================================
-# 3. 测试单个样本的训练
-# ============================================
-print("\n📊 Step 3: 测试单个样本")
+        # 记录访问历史
+        visit_history = defaultdict(int)
+        move_history = []
+        stuck_count = 0
 
-sample = samples[0]
-state = sample['state']
-action = sample['action']
+        while len(connected_dests) < len(dests) and step < max_tree_steps:
+            step += 1
 
-print(f"  State 类型: {type(state)}")
-print(f"  Action: {action}")
-if hasattr(state, 'x'):
-    print(f"  State.x Shape: {state.x.shape}")
+            mask = env.get_low_level_action_mask()
+            valid_actions = np.where(mask)[0]
+            current_node = env.current_node_location
 
-# 前向传播
-try:
-    state_tensor = state.to(agent.device)
+            # 更新已连接的目的节点
+            for dest in dests:
+                if dest in env.current_tree.get('connected_dests', set()):
+                    connected_dests.add(dest)
 
-    # 确保 batch 属性存在
-    if not hasattr(state_tensor, 'batch') or state_tensor.batch is None:
-        state_tensor.batch = torch.zeros(state_tensor.x.size(0), dtype=torch.long, device=agent.device)
+            unconnected = [d for d in dests if d not in connected_dests]
 
-    with torch.no_grad():
-        logits = agent.policy_net(
-            x=state_tensor.x,
-            edge_index=state_tensor.edge_index,
-            edge_attr=state_tensor.edge_attr if hasattr(state_tensor, 'edge_attr') else None,
-            req_vec=state_tensor.req_vec if hasattr(state_tensor, 'req_vec') else torch.zeros(24, device=agent.device),
-            batch=state_tensor.batch
-        )
+            if step % 10 == 0 or len(connected_dests) != len(env.current_tree.get('connected_dests', set())):
+                print(f"\n  [Step {step}] 当前位置: {current_node}")
+                print(f"    已连接: {len(connected_dests)}/{len(dests)} = {list(connected_dests)}")
+                print(f"    未连接: {unconnected}")
+                print(f"    可用动作: {len(valid_actions)}/28")
 
-    print(f"\n  ✅ 前向传播成功")
-    print(f"    Logits 形状: {logits.shape}")
+            # 检查是否卡住（当前节点就是未连接的目的节点）
+            if current_node in unconnected:
+                if current_node in valid_actions:
+                    print(f"    → 当前节点{current_node}是未连接目的节点，尝试连接")
+                    env.step_high_level(0)
+                    result = env.step_low_level(current_node)
 
-    # 检查预测
-    pred_action = logits.argmax(dim=-1).item()
-    print(f"    预测 Action: {pred_action}")
-    print(f"    真实 Action: {action}")
+                    # 检查是否连接成功
+                    if current_node in env.current_tree.get('connected_dests', set()):
+                        connected_dests.add(current_node)
+                        print(f"    ✅ 连接成功！")
+                        stuck_count = 0
+                    else:
+                        print(f"    ❌ 连接失败（在mask中但无法连接）")
+                        stuck_count += 1
+                else:
+                    print(f"    ⚠️  当前节点{current_node}是目的节点但不在mask中！")
+                    stuck_count += 1
+            else:
+                # 选择移动方向
+                if len(valid_actions) == 0:
+                    print(f"    ❌ 没有可用动作！")
+                    break
 
-    # 计算损失
-    target = torch.tensor([action], dtype=torch.long, device=agent.device)
-    criterion = nn.CrossEntropyLoss()
-    loss = criterion(logits, target)
-    print(f"    单样本损失: {loss.item():.4f}")
+                # 计算到未连接节点的距离
+                best_action = None
+                min_dist = float('inf')
 
-except Exception as e:
-    print(f"❌ 前向传播失败: {e}")
-    # 打印更详细的维度信息
-    print(f"    Model input dim: {agent.policy_net.gnn.encoder.node_lin.weight.shape[1]}")
-    print(f"    Data input dim: {state.x.shape[1]}")
-    import traceback
+                for action in valid_actions:
+                    if action == current_node:
+                        continue
 
-    traceback.print_exc()
+                    # 计算到最近未连接节点的距离
+                    for dest in unconnected:
+                        try:
+                            path = env.topology_mgr.get_shortest_path(action, dest)
+                            if path:
+                                dist = len(path) - 1
+                                if dist < min_dist:
+                                    min_dist = dist
+                                    best_action = action
+                        except:
+                            pass
 
-print("\n" + "=" * 70)
-print("诊断完成。如果看到“前向传播成功”，说明维度修复已生效。")
-print("=" * 70)
+                if best_action is None:
+                    # 随机选择
+                    best_action = np.random.choice(valid_actions)
+
+                # 检查是否在循环移动
+                visit_history[current_node] += 1
+                move_history.append((current_node, best_action))
+
+                if len(move_history) > 10:
+                    recent = move_history[-10:]
+                    unique_moves = set(recent)
+                    if len(unique_moves) <= 3:
+                        print(f"    ⚠️  检测到移动循环: {unique_moves}")
+                        stuck_count += 1
+
+                # 执行移动
+                env.step_high_level(0)
+                result = env.step_low_level(best_action)
+
+                if len(result) == 5:
+                    _, _, term, trunc, _ = result
+                    done = term or trunc
+                else:
+                    _, _, done, _ = result
+
+                if done:
+                    print(f"    ⚠️  Episode提前结束")
+                    break
+
+            # 如果卡住太久，退出
+            if stuck_count >= 5:
+                print(f"\n    ❌ 卡住检测：{stuck_count}次无进展")
+                break
+
+        # Episode总结
+        print(f"\n  【Episode {ep} 总结】")
+        print(f"    最终连接: {len(connected_dests)}/{len(dests)}")
+        print(f"    树构建步数: {step}")
+        print(f"    总访问次数最多的节点: {max(visit_history.items(), key=lambda x: x[1]) if visit_history else 'N/A'}")
+
+        # 分析失败原因
+        if len(connected_dests) < len(dests):
+            failure_pattern = {
+                'ep': ep,
+                'connected': len(connected_dests),
+                'total': len(dests),
+                'unconnected': unconnected,
+                'steps': step,
+                'stuck_at': current_node,
+                'visit_counts': dict(visit_history),
+            }
+
+            # 分析为什么无法连接
+            print(f"\n    【失败分析】")
+
+            for dest in unconnected:
+                # 检查从当前位置到未连接节点的路径
+                try:
+                    path = env.topology_mgr.get_shortest_path(current_node, dest)
+                    if path:
+                        print(f"      到节点{dest}: {len(path)-1}跳, 路径存在")
+
+                        # 检查路径上的节点是否在可用动作中
+                        if len(path) > 1:
+                            next_hop = path[1]
+                            mask = env.get_low_level_action_mask()
+                            if next_hop in np.where(mask)[0]:
+                                print(f"        下一跳{next_hop}在mask中 ✅")
+                            else:
+                                print(f"        下一跳{next_hop}不在mask中 ❌")
+
+                                # 分析为什么不在mask中
+                                neighbors = env.resource_mgr.get_neighbors(current_node)
+                                if next_hop not in neighbors:
+                                    print(f"          原因: 不是物理邻居")
+                                else:
+                                    print(f"          原因: 被mask过滤（可能是访问频次或其他原因）")
+                    else:
+                        print(f"      到节点{dest}: ❌ 路径不存在")
+                except Exception as e:
+                    print(f"      到节点{dest}: 错误 {e}")
+
+            failure_patterns.append(failure_pattern)
+
+    # 总结所有失败模式
+    print(f"\n{'='*80}")
+    print("失败模式总结")
+    print('='*80)
+
+    if failure_patterns:
+        print(f"\n共{len(failure_patterns)}个Episode失败")
+
+        # 统计连接情况
+        connection_stats = defaultdict(int)
+        for fp in failure_patterns:
+            connection_stats[fp['connected']] += 1
+
+        print(f"\n连接数统计:")
+        for connected, count in sorted(connection_stats.items()):
+            print(f"  {connected}/5: {count}次")
+
+        # 统计最常见的卡住位置
+        stuck_at_counts = defaultdict(int)
+        for fp in failure_patterns:
+            stuck_at_counts[fp['stuck_at']] += 1
+
+        print(f"\n最常卡住的节点:")
+        for node, count in sorted(stuck_at_counts.items(), key=lambda x: x[1], reverse=True)[:5]:
+            print(f"  节点{node}: {count}次")
+
+        # 分析根本原因
+        print(f"\n【根本原因分析】")
+        print(f"1. Mask过于严格")
+        print(f"   - 树构建阶段的mask可能排除了通往未连接节点的路径")
+        print(f"   - 节点访问频次限制可能太严（visit_count >= 3）")
+        print(f"2. 循环移动")
+        print(f"   - Agent在少数几个节点间循环移动")
+        print(f"   - 没有有效的导航策略")
+        print(f"3. 可达性检查失败")
+        print(f"   - _find_best_path_to_unconnected可能失败")
+        print(f"   - 导致mask中没有可用动作")
+
+        print(f"\n【建议修复】")
+        print(f"1. 放宽节点访问频次限制（visit_count < 5）")
+        print(f"2. 改进可达性检查逻辑")
+        print(f"3. 增加导航提示（朝向未连接节点）")
+        print(f"4. 如果mask为空，允许所有物理邻居")
+    else:
+        print(f"✅ 所有Episode都成功连接所有目的节点！")
+
+if __name__ == "__main__":
+    analyze_tree_building_failure()

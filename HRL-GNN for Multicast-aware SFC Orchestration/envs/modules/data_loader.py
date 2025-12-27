@@ -2,13 +2,18 @@ import pickle
 import os
 import logging
 import numpy as np
+import copy
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-
 class DataLoader:
-    """数据加载器：最终修复版 (支持 arrive_event/leave_event 键名)"""
+    """
+    数据加载器：最终修复版 V3
+    1. ✅ 自动适配旧数据格式
+    2. ✅ 支持 copy() 方法
+    3. ✅ 支持字典式赋值 (req['key'] = val)
+    """
 
     def __init__(self, config: dict):
         self.cfg = config
@@ -19,7 +24,7 @@ class DataLoader:
         self.total_steps = 0
 
     def load_dataset(self, phase_or_req_file: str, events_file: Optional[str] = None) -> bool:
-        # --- 路径查找逻辑 (保持不变) ---
+        # --- 路径查找逻辑 ---
         if events_file is not None:
             req_filename = phase_or_req_file
             possible_dirs = [
@@ -48,6 +53,7 @@ class DataLoader:
             data_dir = self.cfg['path'].get('input_dir', 'data/input_dir')
             req_path = os.path.join(data_dir, f"{phase}_requests.pkl")
             evt_path = os.path.join(data_dir, f"{phase}_events.pkl")
+
             if not os.path.exists(req_path) or not os.path.exists(evt_path):
                 alt_dir = self.cfg['path'].get('expert_data_dir', 'data/expert')
                 req_path = os.path.join(alt_dir, f"{phase}_requests.pkl")
@@ -59,78 +65,55 @@ class DataLoader:
 
     def _load_from_paths(self, req_path, evt_path):
         try:
-            # 1. 加载请求
+            logger.info(f"Loading requests from: {req_path}")
             with open(req_path, 'rb') as f:
-                self.requests = pickle.load(f)
+                raw_requests = pickle.load(f)
+
+            # 🔥 应用适配器
+            self.requests = [self._adapt_legacy_format(r) for r in raw_requests]
 
             self.req_map = {}
             for r in self.requests:
-                rid = int(r['id'])
-                r['id'] = rid
+                rid = int(getattr(r, 'id', r.get('id'))) if hasattr(r, 'id') or isinstance(r, dict) else -1
+                if rid == -1: rid = len(self.req_map) + 1
+
+                # 统一更新 ID
+                if isinstance(r, dict): r['id'] = rid
+                else: r.id = rid
+
                 self.req_map[rid] = r
 
-            # 2. 加载事件
+            logger.info(f"Loading events from: {evt_path}")
             with open(evt_path, 'rb') as f:
                 raw_events = pickle.load(f)
 
-            # 3. 🔥 [关键修复] 适配 arrive_event / leave_event
             self.events = []
             all_event_ids = set()
 
             for i, evt in enumerate(raw_events):
                 arr, lv = [], []
-
-                # 情况 A: 字典格式
                 if isinstance(evt, dict):
-                    # 🔥 优先检查 arrive_event (您的数据格式)
                     arr = evt.get('arrive_event', evt.get('arrive', evt.get('arrived', [])))
                     lv = evt.get('leave_event', evt.get('leave', evt.get('left', [])))
-
-                # 情况 B: 列表/元组格式
                 elif isinstance(evt, (list, tuple, np.ndarray)):
                     if len(evt) >= 1: arr = evt[0]
                     if len(evt) >= 2: lv = evt[1]
 
-                # 转换为 int 列表
                 arr = np.array(arr, dtype=int).flatten().tolist()
                 lv = np.array(lv, dtype=int).flatten().tolist()
-
                 self.events.append({'arrive': arr, 'leave': lv})
                 all_event_ids.update(arr)
 
             self.total_steps = len(self.events)
             self.reset()
 
-            # 4. ID 对齐检查与修正
-            if len(all_event_ids) > 0:
-                req_ids = set(self.req_map.keys())
-                overlap = req_ids.intersection(all_event_ids)
+            logger.info(f"✅ Dataset Loaded: {len(self.requests)} requests, {self.total_steps} time steps")
 
-                if len(overlap) == 0:
-                    logger.warning("⚠️ Request/Event ID 不匹配，正在尝试修复...")
+            if len(self.requests) > 0:
+                sample = self.requests[0]
+                chain = getattr(sample, 'sfc_chain', [])
+                logger.info(f"🔍 Sample Req[0]: ID={getattr(sample, 'id', '?')}, Len={len(chain)}, Chain={chain}")
 
-                    # 尝试偏移 -1
-                    shifted_down = {x - 1 for x in all_event_ids}
-                    if len(req_ids.intersection(shifted_down)) > 0:
-                        logger.info("🔧 修复: Event ID - 1 (1-based -> 0-based)")
-                        for e in self.events:
-                            e['arrive'] = [x - 1 for x in e['arrive']]
-                            e['leave'] = [x - 1 for x in e['leave']]
-                    # 尝试偏移 +1
-                    else:
-                        shifted_up = {x + 1 for x in all_event_ids}
-                        if len(req_ids.intersection(shifted_up)) > 0:
-                            logger.info("🔧 修复: Event ID + 1")
-                            for e in self.events:
-                                e['arrive'] = [x + 1 for x in e['arrive']]
-                                e['leave'] = [x + 1 for x in e['leave']]
-                        else:
-                            # 您的请求ID是 1, 20... 如果事件里是 0, 19... 则需要+1
-                            logger.warning("❌ 无法自动对齐 ID，将按原样尝试...")
-            else:
-                logger.warning(f"⚠️ 加载了 {len(self.events)} 个时间步，但似乎所有 arrive_event 都是空的？")
-
-            logger.info(f"Loaded dataset: {len(self.requests)} requests, {self.total_steps} steps")
             return True
 
         except Exception as e:
@@ -138,6 +121,63 @@ class DataLoader:
             import traceback
             traceback.print_exc()
             return False
+
+    def _adapt_legacy_format(self, item):
+        # 1. 转为字典处理
+        if not isinstance(item, dict) and hasattr(item, '__dict__'):
+            data = item.__dict__.copy()
+        elif isinstance(item, dict):
+            data = item.copy()
+        else:
+            return item
+
+        # 2. 映射 VNF 链
+        if 'sfc_chain' not in data:
+            for key in ['vnf', 'chain', 'SFC', 'VNF_chain']:
+                if key in data:
+                    data['sfc_chain'] = data[key]
+                    break
+            if 'sfc_chain' not in data: data['sfc_chain'] = []
+
+        # 3. 映射 CPU
+        if 'vnf_cpu_demands' not in data:
+            for key in ['cpu_origin', 'cpu', 'CPU', 'vnf_cpu']:
+                if key in data:
+                    data['vnf_cpu_demands'] = data[key]
+                    break
+            if 'vnf_cpu_demands' not in data:
+                data['vnf_cpu_demands'] = [10.0] * len(data['sfc_chain'])
+
+        # 4. 映射带宽
+        if 'bandwidth_demand' not in data:
+            for key in ['bw_origin', 'bw', 'BW']:
+                if key in data:
+                    data['bandwidth_demand'] = data[key]
+                    break
+            if 'bandwidth_demand' not in data: data['bandwidth_demand'] = 10.0
+
+        # 5. 封装成全能对象
+        class SFCRequest:
+            def __init__(self, **entries):
+                self.__dict__.update(entries)
+
+            def __repr__(self):
+                return f"Req(id={self.id}, len={len(self.sfc_chain)})"
+
+            def get(self, key, default=None):
+                return self.__dict__.get(key, default)
+
+            def __getitem__(self, key):
+                return self.__dict__[key]
+
+            # 🔥 新增 setitem，支持 req['dest'] = ...
+            def __setitem__(self, key, value):
+                self.__dict__[key] = value
+
+            def copy(self):
+                return SFCRequest(**self.__dict__)
+
+        return SFCRequest(**data)
 
     def reset(self):
         self.time_step = 0

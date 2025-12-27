@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+High-Level Policy (重构版)
+职责：从未连接的目标节点中选择下一个要连接的节点（subgoal selection）
+"""
 
 import torch
 import torch.nn as nn
 import logging
-from typing import Optional, List, Tuple
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +18,6 @@ def deep_get(cfg, keys, default=None):
     if cfg is None:
         return default
 
-    # dict
     if isinstance(cfg, dict):
         for k in keys:
             if k in cfg and cfg[k] is not None:
@@ -26,7 +29,6 @@ def deep_get(cfg, keys, default=None):
                     return found
         return default
 
-    # object / Namespace
     for k in keys:
         if hasattr(cfg, k):
             val = getattr(cfg, k)
@@ -36,309 +38,232 @@ def deep_get(cfg, keys, default=None):
     return default
 
 
-class HierarchicalPolicy(nn.Module):
+class HighLevelPolicy(nn.Module):
+    """
+    High-Level Policy Network (重构版)
+
+    职责：
+    1. 从未连接的目标节点中选择下一个要连接的节点
+    2. 生成subgoal embedding供Low-Level使用
+
+    输入：GNN编码后的图嵌入
+    输出：
+        - Q值（用于目标选择）
+        - Subgoal embedding（给Low-Level）
+    """
+
     def __init__(self, config):
         super().__init__()
 
-        # =========================
         # 设备配置
-        # =========================
         use_cuda = deep_get(config, ["use_cuda"], False)
         self.device = torch.device(
             "cuda" if torch.cuda.is_available() and use_cuda else "cpu"
         )
 
-        # =========================
         # 维度配置
-        # =========================
-        node_feat_dim = deep_get(config, ["node_feat_dim"])
-        edge_feat_dim = deep_get(config, ["edge_feat_dim"])
-        request_feat_dim = deep_get(config, ["request_feat_dim"])
-        hidden_dim = deep_get(config, ["hidden_dim"])
+        self.hidden_dim = deep_get(config, ["hidden_dim"], 128)
+        self.goal_dim = deep_get(config, ["goal_dim"], 64)
 
-        # 🔥 关键修复：获取 GNN 实际输出维度（优先使用gnn_output_dim，否则用hidden_dim）
-        self.gnn_output_dim = deep_get(config, ["gnn_output_dim"], hidden_dim)
-
-        # 🔥 修复：如果向量化版本输出100，但配置为128，则自动调整
-        gnn_output_type = deep_get(config, ["gnn_output_type"], "hidden")
-        if gnn_output_type == "hidden" and self.gnn_output_dim == hidden_dim:
-            # 检查是否是向量化版本（输出100维）
-            logger.info(f"检测GNN输出类型: gnn_output_type={gnn_output_type}, gnn_output_dim={self.gnn_output_dim}")
-
-        # 🔥 关键修复：优先从 environment 配置读取 action_dim
-        # Phase 2/3 的 action_dim 应该等于节点数
+        # 从环境配置读取目标数量
         env_cfg = config.get('environment', {})
-        action_dim = env_cfg.get('nb_low_level_actions', None)
+        self.num_goals = env_cfg.get('nb_high_level_goals', 10)
 
-        # 如果环境配置中没有，再尝试其他位置
-        if action_dim is None:
-            action_dim = deep_get(
-                config,
-                ["action_dim", "num_actions", "action_size", "n_actions"],
-            )
+        # GNN输出维度
+        self.gnn_output_dim = deep_get(config, ["gnn_output_dim"], self.hidden_dim)
 
-        if action_dim is None:
-            action_dim = deep_get(config, ["action_space"], None)
+        dropout = deep_get(config, ["dropout"], 0.1)
 
-        if isinstance(action_dim, (list, tuple)):
-            action_dim = len(action_dim)
+        logger.info(f"HighLevelPolicy配置:")
+        logger.info(f"  GNN输出维度: {self.gnn_output_dim}")
+        logger.info(f"  Goal维度: {self.goal_dim}")
+        logger.info(f"  目标数量: {self.num_goals}")
 
-        if action_dim is None:
-            action_dim = 28  # 工程级兜底
-            logger.warning(f"Action维度未指定，使用默认值: {action_dim}")
-
-        logger.info(f"✅ Action维度确定: {action_dim}")
-
-        dropout = deep_get(config, ["dropout"], 0.0)
-
-        # =========================
-        # 强校验
-        # =========================
-        required_dims = {
-            "node_feat_dim": node_feat_dim,
-            "edge_feat_dim": edge_feat_dim,
-            "request_feat_dim": request_feat_dim,
-            "hidden_dim": hidden_dim,
-        }
-
-        for name, value in required_dims.items():
-            if value is None:
-                raise RuntimeError(f"{name} is missing in config")
-
-        # =========================
-        # GNN 配置
-        # =========================
-        from core.gnn.multicast_aware_gat import MulticastAwareGAT
-
-        # 🔥 关键修复：确定 GNN 输出类型
-        self.gnn_output_type = gnn_output_type
-
-        logger.info(f"GNN配置: node_feat={node_feat_dim}, edge_feat={edge_feat_dim}, "
-                    f"req={request_feat_dim}, hidden={hidden_dim}, action={action_dim}")
-        logger.info(f"GNN输出类型: {self.gnn_output_type}")
-        logger.info(f"GNN输出维度: {self.gnn_output_dim} (hidden_dim={hidden_dim})")
-
-        # =========================
-        # GNN 初始化
-        # =========================
-        self.gnn = MulticastAwareGAT(
-            node_feat_dim=node_feat_dim,
-            edge_feat_dim=edge_feat_dim,
-            request_dim=request_feat_dim,
-            hidden_dim=hidden_dim,
-            # 🔥 修复：移除 action_dim，GNN 应该输出 hidden_dim
-            dropout=dropout,
+        # ============================================
+        # 1. State Projection（状态投影）
+        # ============================================
+        self.state_projection = nn.Sequential(
+            nn.Linear(self.gnn_output_dim, self.hidden_dim),
+            nn.LayerNorm(self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
         )
 
-        # =========================
-        # 🔥 关键修复：Policy head（根据 GNN 实际输出维度调整）
-        # =========================
-        if self.gnn_output_type == "action":
-            # GNN 直接输出 action_dim
-            self.policy_head = nn.Identity()
-            logger.info("使用Identity policy_head (GNN直接输出action维度)")
-        elif self.gnn_output_type == "hidden":
-            # 🔥 修复：使用实际 GNN 输出维度
-            # 如果gnn_output_dim未设置，则使用hidden_dim
-            actual_gnn_output_dim = self.gnn_output_dim
+        # ============================================
+        # 2. Q Network（目标选择）
+        # ============================================
+        self.q_network = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, self.num_goals)
+        )
 
-            self.policy_head = nn.Sequential(
-                nn.Linear(actual_gnn_output_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, action_dim),
-            )
-            logger.info(f"Policy head: {actual_gnn_output_dim} -> {hidden_dim} -> {action_dim}")
+        # ============================================
+        # 3. Subgoal Generator（生成goal embedding）
+        # ============================================
+        self.subgoal_generator = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, self.goal_dim),
+            nn.Tanh()  # 归一化到[-1, 1]
+        )
 
-            # 保存实际使用的维度
-            self.actual_gnn_output_dim = actual_gnn_output_dim
-        else:
-            raise ValueError(f"未知的gnn_output_type: {self.gnn_output_type}")
+        # ============================================
+        # 4. Value Network（状态价值评估）
+        # ============================================
+        self.value_network = nn.Sequential(
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1)
+        )
 
-        # =========================
-        # 调试配置
-        # =========================
-        self.debug_mode = deep_get(config, ["debug", "debug_mode"], False)
-        self.shape_log = []
-
-        # 移动到设备
         self.to(self.device)
 
-        logger.info(f"HierarchicalPolicy 初始化完成，设备: {self.device}")
+        logger.info(f"✅ HighLevelPolicy初始化完成，设备: {self.device}")
 
     def forward(
             self,
-            x: torch.Tensor,
-            edge_index: torch.Tensor,
-            edge_attr: torch.Tensor,
-            req_vec: torch.Tensor,
-            batch: Optional[torch.Tensor] = None,
-            goal_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+            graph_emb: torch.Tensor,
+            return_subgoal: bool = True,
+            return_value: bool = False
+    ) -> tuple:
         """
         前向传播
 
         Args:
-            x: 节点特征 [num_nodes, node_feat_dim]
-            edge_index: 边索引 [2, num_edges]
-            edge_attr: 边特征 [num_edges, edge_feat_dim]
-            req_vec: 请求特征 [batch_size, request_feat_dim] 或 [request_feat_dim]
-            batch: 批索引 [num_nodes] 或 None
-            goal_mask: 动作掩码 [batch_size, action_dim] 或 None
+            graph_emb: 图嵌入 [batch, gnn_output_dim]
+            return_subgoal: 是否返回subgoal embedding
+            return_value: 是否返回value
 
         Returns:
-            logits: 动作logits [batch_size, action_dim]
+            q_values: 目标Q值 [batch, num_goals]
+            subgoal_emb: 子目标嵌入 [batch, goal_dim] (可选)
+            value: 状态价值 [batch, 1] (可选)
         """
-        # 调试信息
-        if self.debug_mode:
-            self.shape_log.clear()
-            self._log_shape("输入 x", x)
-            self._log_shape("输入 edge_index", edge_index)
-            self._log_shape("输入 edge_attr", edge_attr)
-            self._log_shape("输入 req_vec", req_vec)
-            if batch is not None:
-                self._log_shape("输入 batch", batch)
+        # 投影状态
+        z = self.state_projection(graph_emb)
 
-        # 1. 设备对齐
-        x, edge_index, edge_attr, req_vec, batch, goal_mask = self._ensure_device(
-            x, edge_index, edge_attr, req_vec, batch, goal_mask
+        # Q值（用于选择目标）
+        q_values = self.q_network(z)
+
+        # 可选返回
+        subgoal_emb = None
+        value = None
+
+        if return_subgoal:
+            subgoal_emb = self.subgoal_generator(z)
+
+            # 处理NaN
+            if torch.isnan(subgoal_emb).any():
+                logger.warning("⚠️ Subgoal包含NaN，使用零向量")
+                subgoal_emb = torch.zeros_like(subgoal_emb)
+
+        if return_value:
+            value = self.value_network(z)
+
+        return q_values, subgoal_emb, value
+
+    def select_goal(
+            self,
+            graph_emb: torch.Tensor,
+            valid_goals: Optional[torch.Tensor] = None,
+            epsilon: float = 0.0
+    ) -> tuple:
+        """
+        选择目标（epsilon-greedy）
+
+        Args:
+            graph_emb: 图嵌入 [batch, gnn_output_dim]
+            valid_goals: 有效目标mask [batch, num_goals]
+            epsilon: 探索率
+
+        Returns:
+            goal_idx: 选择的目标索引 [batch]
+            subgoal_emb: 对应的subgoal embedding [batch, goal_dim]
+        """
+        batch_size = graph_emb.size(0)
+
+        # 前向传播
+        q_values, subgoal_emb, _ = self.forward(
+            graph_emb,
+            return_subgoal=True,
+            return_value=False
         )
 
-        # 2. 输入预处理
-        batch = self._preprocess_batch(batch, x.shape[0])
-        req_vec = self._preprocess_req_vec(req_vec, batch)
+        # 应用mask
+        if valid_goals is not None:
+            q_values = q_values.masked_fill(valid_goals == 0, float('-inf'))
 
-        # 3. GNN 前向
-        graph_emb = self.gnn(
-            x=x,
-            edge_index=edge_index,
-            edge_attr=edge_attr,
-            req_vec=req_vec,
-            batch=batch,
-        )
-
-        if self.debug_mode:
-            self._log_shape("GNN输出 graph_emb", graph_emb)
-
-        # 🔥 关键修复：维度兼容性检查
-        if graph_emb.shape[1] != self.actual_gnn_output_dim:
-            logger.warning(f"GNN输出维度 {graph_emb.shape[1]} 与配置维度 {self.actual_gnn_output_dim} 不匹配")
-
-            if isinstance(self.policy_head[0], nn.Linear):
-                expected_dim = self.policy_head[0].in_features
-                actual_dim = graph_emb.shape[1]
-
-                if expected_dim != actual_dim:
-                    logger.warning(f"Policy head 期望维度 {expected_dim}, 实际维度 {actual_dim}")
-
-                    # 自动维度调整
-                    if actual_dim < expected_dim:
-                        # 填充零
-                        padding = torch.zeros(graph_emb.size(0), expected_dim - actual_dim,
-                                              device=graph_emb.device)
-                        graph_emb = torch.cat([graph_emb, padding], dim=1)
-                        logger.debug(f"自动填充维度: {actual_dim} -> {expected_dim}")
-                    elif actual_dim > expected_dim:
-                        # 截断
-                        graph_emb = graph_emb[:, :expected_dim]
-                        logger.debug(f"自动截断维度: {actual_dim} -> {expected_dim}")
-                    else:
-                        # 创建适配的线性层
-                        logger.info(f"重新初始化policy_head以适应维度 {actual_dim}")
-                        self.policy_head[0] = nn.Linear(actual_dim, self.policy_head[0].out_features).to(
-                            graph_emb.device)
-
-        # 4. Policy head
-        logits = self.policy_head(graph_emb)
-
-        if self.debug_mode:
-            self._log_shape("Policy head输出 logits", logits)
-
-        # 5. Mask 处理
-        if goal_mask is not None:
-            goal_mask = goal_mask.to(logits.device)
-            if goal_mask.shape != logits.shape:
-                raise ValueError(
-                    f"goal_mask形状{goal_mask.shape}与logits形状{logits.shape}不匹配"
-                )
-            logits = logits.masked_fill(goal_mask == 0, float("-inf"))
-
-        # 6. 调试输出
-        if self.debug_mode:
-            self._print_shape_log()
-
-        return logits
-
-    def _ensure_device(self, x, edge_index, edge_attr, req_vec, batch, goal_mask):
-        """确保所有张量在正确设备上"""
-        tensors = [x, edge_index, edge_attr, req_vec]
-        names = ["x", "edge_index", "edge_attr", "req_vec"]
-
-        for i, (tensor, name) in enumerate(zip(tensors, names)):
-            if tensor.device != self.device:
-                logger.debug(f"移动 {name} 从 {tensor.device} 到 {self.device}")
-                tensors[i] = tensor.to(self.device)
-
-        if batch is not None and batch.device != self.device:
-            batch = batch.to(self.device)
-
-        if goal_mask is not None and goal_mask.device != self.device:
-            goal_mask = goal_mask.to(self.device)
-
-        return (*tensors, batch, goal_mask)
-
-    def _preprocess_batch(self, batch: Optional[torch.Tensor], num_nodes: int) -> torch.Tensor:
-        """预处理batch张量"""
-        if batch is None:
-            # 所有节点属于同一个图
-            return torch.zeros(num_nodes, dtype=torch.long, device=self.device)
-
-        if batch.dim() != 1:
-            raise ValueError(f"batch应为1维，实际为{batch.dim()}维")
-
-        return batch
-
-    def _preprocess_req_vec(self, req_vec: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
-        """预处理请求特征"""
-        if req_vec.dim() == 1:
-            # [request_feat_dim] -> [1, request_feat_dim]
-            req_vec = req_vec.unsqueeze(0)
-
-        # 获取图数量
-        num_graphs = batch.max().item() + 1
-
-        if req_vec.shape[0] == 1 and num_graphs > 1:
-            # 广播到所有图
-            req_vec = req_vec.repeat(num_graphs, 1)
-        elif req_vec.shape[0] != num_graphs:
-            raise ValueError(
-                f"req_vec batch_size {req_vec.shape[0]} 与图数量 {num_graphs} 不匹配"
-            )
-
-        return req_vec
-
-    def _log_shape(self, name: str, tensor: torch.Tensor):
-        """记录张量形状"""
-        if tensor is not None:
-            self.shape_log.append(f"{name}: {tensor.shape}")
+        # Epsilon-greedy
+        if self.training and torch.rand(1).item() < epsilon:
+            # 随机选择（从有效目标中）
+            if valid_goals is not None:
+                valid_indices = (valid_goals > 0).nonzero(as_tuple=True)[1]
+                if len(valid_indices) > 0:
+                    # 每个batch随机选一个
+                    goal_idx = valid_indices[
+                        torch.randint(0, len(valid_indices), (batch_size,))
+                    ]
+                else:
+                    goal_idx = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+            else:
+                goal_idx = torch.randint(0, self.num_goals, (batch_size,), device=self.device)
         else:
-            self.shape_log.append(f"{name}: None")
+            # Greedy选择
+            goal_idx = torch.argmax(q_values, dim=1)
 
-    def _print_shape_log(self):
-        """打印形状日志"""
-        print("\n" + "=" * 60)
-        print("HierarchicalPolicy 形状调试信息")
-        print("=" * 60)
-        for log in self.shape_log:
-            print(f"  {log}")
-        print("=" * 60 + "\n")
+        return goal_idx, subgoal_emb
 
-    def get_config_summary(self) -> dict:
-        """获取配置摘要"""
-        return {
-            "device": str(self.device),
-            "gnn_output_type": self.gnn_output_type,
-            "gnn_output_dim": self.gnn_output_dim,
-            "policy_head_type": type(self.policy_head).__name__,
-            "debug_mode": self.debug_mode,
-        }
+
+# ============================================
+# 向后兼容：保留旧接口
+# ============================================
+
+class HierarchicalPolicy(nn.Module):
+    """
+    向后兼容的HierarchicalPolicy
+
+    这是为了不破坏现有代码而保留的接口
+    实际上会调用重构后的HighLevelPolicy
+    """
+
+    def __init__(self, config):
+        super().__init__()
+
+        logger.warning("⚠️ HierarchicalPolicy已弃用，请使用HighLevelPolicy")
+        logger.warning("   当前使用兼容模式，功能可能受限")
+
+        # 使用新的HighLevelPolicy
+        self.high_policy = HighLevelPolicy(config)
+
+        # 复制属性以保持兼容
+        self.device = self.high_policy.device
+        self.gnn_output_dim = self.high_policy.gnn_output_dim
+        self.num_goals = self.high_policy.num_goals
+
+    def forward(
+            self,
+            graph_emb: torch.Tensor,
+            goal_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        兼容旧接口
+
+        Args:
+            graph_emb: 图嵌入 [batch, gnn_output_dim]
+            goal_mask: 目标mask [batch, num_goals]
+
+        Returns:
+            logits: 动作logits [batch, num_goals]
+        """
+        # 调用新接口
+        q_values, _, _ = self.high_policy(graph_emb, return_subgoal=False)
+
+        # 应用mask
+        if goal_mask is not None:
+            q_values = q_values.masked_fill(goal_mask == 0, float('-inf'))
+
+        return q_values

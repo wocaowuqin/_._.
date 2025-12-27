@@ -1,204 +1,154 @@
-#!/usr/bin/env python3
-"""Phase 2 深度诊断"""
+"""
+目的节点距离分析
+检查请求中目的节点是否聚集还是分散
+"""
 
-import torch
-import pickle
 import numpy as np
+import matplotlib.pyplot as plt
 from pathlib import Path
 
-print("=" * 70)
-print("🔬 Phase 2 深度诊断")
-print("=" * 70)
+def analyze_dest_clustering(env, num_samples=100):
+    """
+    分析目的节点的聚集程度
+    """
+    print("=" * 60)
+    print("目的节点距离分析")
+    print("=" * 60)
 
-# ============================================
-# 1. 检查模型配置
-# ============================================
-print("\n📊 1. 检查模型配置")
+    results = []
 
-model_path = Path("outputs/checkpoints/il_model_final.pth")
-if model_path.exists():
-    checkpoint = torch.load(model_path, map_location='cpu')
+    for i in range(num_samples):
+        env.reset()
+        req = env.current_request
 
-    if 'policy_net' in checkpoint:
-        state_dict = checkpoint['policy_net']
+        if req is None:
+            continue
 
-        # 找到输出层
-        output_layers = {}
-        for key, value in state_dict.items():
-            if 'weight' in key and ('output' in key or 'head' in key or 'fc' in key):
-                if len(value.shape) >= 2:
-                    output_layers[key] = value.shape
+        src = req.get('source', 0)
+        dests = req.get('dest', [])
 
-        print("  模型输出层:")
-        for name, shape in output_layers.items():
-            print(f"    {name}: {shape}")
+        if len(dests) < 2:
+            continue
 
-            # 检查输出维度
-            output_dim = shape[0]
-            if output_dim == 28:
-                print(f"      ✅ 输出维度正确: {output_dim}")
-            else:
-                print(f"      ❌ 输出维度错误: {output_dim} (应该是 28)")
+        # 计算所有目的节点之间的距离
+        inter_dest_distances = []
+        for j, d1 in enumerate(dests):
+            for d2 in dests[j+1:]:
+                path = env._find_path(d1, d2)
+                if path:
+                    dist = len(path) - 1
+                    inter_dest_distances.append(dist)
 
-    if 'val_loss' in checkpoint:
-        print(f"\n  最终验证损失: {checkpoint['val_loss']:.4f}")
+        # 计算源节点到每个目的节点的距离
+        src_to_dest_distances = []
+        for d in dests:
+            path = env._find_path(src, d)
+            if path:
+                dist = len(path) - 1
+                src_to_dest_distances.append(dist)
 
-        if checkpoint['val_loss'] > 3.0:
-            print(f"    ❌ 损失异常高（> 3.0）")
-        elif checkpoint['val_loss'] > 1.0:
-            print(f"    ⚠️  损失偏高（> 1.0）")
-        else:
-            print(f"    ✅ 损失正常（< 1.0）")
-else:
-    print("  ⚠️  模型文件不存在")
+        if not inter_dest_distances or not src_to_dest_distances:
+            continue
 
-# ============================================
-# 2. 分析数据分布
-# ============================================
-print("\n📊 2. 分析数据分布")
+        result = {
+            'req_id': req.get('request_id', i),
+            'src': src,
+            'dests': dests,
+            'num_dests': len(dests),
+            'avg_inter_dest_dist': np.mean(inter_dest_distances),
+            'max_inter_dest_dist': np.max(inter_dest_distances),
+            'min_inter_dest_dist': np.min(inter_dest_distances),
+            'std_inter_dest_dist': np.std(inter_dest_distances),
+            'avg_src_to_dest': np.mean(src_to_dest_distances),
+            'max_src_to_dest': np.max(src_to_dest_distances),
+            'min_src_to_dest': np.min(src_to_dest_distances),
+        }
 
-data_path = Path("outputs/expert/expert_data_final.pkl")
-if data_path.exists():
-    with open(data_path, 'rb') as f:
-        data = pickle.load(f)
+        results.append(result)
 
-    transitions = data.get('success', [])
+    # 统计分析
+    print(f"\n分析了 {len(results)} 个请求")
+    print("\n【目的节点间距离统计】")
+    avg_inter = [r['avg_inter_dest_dist'] for r in results]
+    max_inter = [r['max_inter_dest_dist'] for r in results]
 
-    # 提取所有 action（转换后）
-    actions = []
-    for trans in transitions:
-        action = trans.get('action')
+    print(f"  平均距离: {np.mean(avg_inter):.2f} ± {np.std(avg_inter):.2f}")
+    print(f"  最大距离: {np.mean(max_inter):.2f} ± {np.std(max_inter):.2f}")
 
-        if isinstance(action, dict):
-            path = action.get('path', [])
-            for node in path[1:]:
-                if isinstance(node, np.integer):
-                    node = int(node)
+    print("\n【源到目的节点距离统计】")
+    avg_src = [r['avg_src_to_dest'] for r in results]
+    max_src = [r['max_src_to_dest'] for r in results]
 
-                # 转换为 0-based
-                if node >= 1 and node <= 28:
-                    node = node - 1
+    print(f"  平均距离: {np.mean(avg_src):.2f} ± {np.std(avg_src):.2f}")
+    print(f"  最大距离: {np.mean(max_src):.2f} ± {np.std(max_src):.2f}")
 
-                actions.append(node)
+    # 聚集度分析
+    print("\n【聚集度分析】")
+    clustered = 0  # 聚集型（目的节点彼此靠近）
+    dispersed = 0  # 分散型（目的节点分散）
 
-    print(f"  总 Action 数: {len(actions)}")
-    print(f"  Action 范围: [{min(actions)}, {max(actions)}]")
-    print(f"  唯一 Action 数: {len(set(actions))}")
+    for r in results:
+        if r['avg_inter_dest_dist'] < 3.0:
+            clustered += 1
+        elif r['avg_inter_dest_dist'] > 6.0:
+            dispersed += 1
 
-    # Action 分布
-    from collections import Counter
+    print(f"  聚集型 (平均间距<3): {clustered} ({clustered/len(results)*100:.1f}%)")
+    print(f"  分散型 (平均间距>6): {dispersed} ({dispersed/len(results)*100:.1f}%)")
+    print(f"  中等型: {len(results)-clustered-dispersed} ({(len(results)-clustered-dispersed)/len(results)*100:.1f}%)")
 
-    action_counts = Counter(actions)
+    # 找出最分散的请求
+    print("\n【最分散的5个请求】")
+    sorted_results = sorted(results, key=lambda x: x['max_inter_dest_dist'], reverse=True)
+    for i, r in enumerate(sorted_results[:5]):
+        print(f"  {i+1}. Req={r['req_id']}, Src={r['src']}, Dests={r['dests']}")
+        print(f"     目的节点间最大距离: {r['max_inter_dest_dist']}")
+        print(f"     源到目的最大距离: {r['max_src_to_dest']}")
 
-    print(f"\n  Action 分布（Top 10）:")
-    for action, count in action_counts.most_common(10):
-        percentage = count / len(actions) * 100
-        bar = '█' * int(percentage)
-        print(f"    Action {action:2d}: {count:4d} 次 ({percentage:5.2f}%) {bar}")
+    # 可视化
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-    # 检查分布是否均匀
-    max_count = max(action_counts.values())
-    min_count = min(action_counts.values())
-    ratio = max_count / max(min_count, 1)
+    # 图1：目的节点间距离分布
+    axes[0].hist(avg_inter, bins=20, alpha=0.7, label='平均间距')
+    axes[0].hist(max_inter, bins=20, alpha=0.7, label='最大间距')
+    axes[0].axvline(3.0, color='g', linestyle='--', label='聚集阈值')
+    axes[0].axvline(6.0, color='r', linestyle='--', label='分散阈值')
+    axes[0].set_xlabel('距离 (跳数)')
+    axes[0].set_ylabel('请求数量')
+    axes[0].set_title('目的节点间距离分布')
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
 
-    print(f"\n  分布均匀性:")
-    print(f"    最多: {max_count} 次")
-    print(f"    最少: {min_count} 次")
-    print(f"    比例: {ratio:.2f}:1")
+    # 图2：目的节点数量 vs 平均间距
+    num_dests = [r['num_dests'] for r in results]
+    axes[1].scatter(num_dests, avg_inter, alpha=0.5)
+    axes[1].set_xlabel('目的节点数量')
+    axes[1].set_ylabel('平均节点间距')
+    axes[1].set_title('节点数量 vs 聚集度')
+    axes[1].grid(alpha=0.3)
 
-    if ratio > 10:
-        print(f"    ⚠️  数据分布严重不均（比例 > 10:1）")
-        print(f"       这可能导致模型偏向高频 Action")
-    elif ratio > 5:
-        print(f"    ⚠️  数据分布不均（比例 > 5:1）")
-    else:
-        print(f"    ✅ 数据分布相对均匀")
+    plt.tight_layout()
 
-# ============================================
-# 3. 计算理论最低损失
-# ============================================
-print("\n📊 3. 计算理论最低损失")
+    output_dir = Path('outputs/analysis')
+    output_dir.mkdir(parents=True, exist_ok=True)
+    plt.savefig(output_dir / 'dest_clustering_analysis.png', dpi=150)
+    print(f"\n📊 图表已保存到: {output_dir / 'dest_clustering_analysis.png'}")
 
-if actions:
-    # 如果模型总是预测最频繁的 action
-    most_common_action, most_common_count = action_counts.most_common(1)[0]
-    majority_accuracy = most_common_count / len(actions)
+    return results
 
-    # 交叉熵损失的理论下界
-    # 如果模型完美预测，loss = -log(1) = 0
-    # 如果模型随机预测（28类），loss = -log(1/28) ≈ 3.33
-    # 如果模型总是预测 majority class，loss = -log(majority_accuracy)
+# 使用示例
+if __name__ == "__main__":
+    import sys
+    sys.path.append('.')
 
-    random_baseline_loss = -np.log(1 / 28)
-    majority_baseline_loss = -np.log(majority_accuracy)
+    from utils.config_utils import load_config
+    from envs.sfc_env import SFC_HIRL_Env
 
-    print(f"  随机预测 Baseline: {random_baseline_loss:.4f}")
-    print(f"  多数类 Baseline: {majority_baseline_loss:.4f}")
-    print(f"  完美预测: 0.0000")
+    config = load_config('phase3')
+    env = SFC_HIRL_Env(config, use_gnn=True)
 
-    current_loss = checkpoint.get('val_loss', 3.24) if model_path.exists() else 3.24
-    print(f"\n  当前验证损失: {current_loss:.4f}")
+    results = analyze_dest_clustering(env, num_samples=200)
 
-    if abs(current_loss - random_baseline_loss) < 0.1:
-        print(f"    ❌ 损失接近随机猜测（{random_baseline_loss:.2f}）")
-        print(f"       模型基本没有学到任何东西！")
-    elif current_loss > majority_baseline_loss:
-        print(f"    ❌ 损失高于多数类 Baseline（{majority_baseline_loss:.2f}）")
-        print(f"       模型表现不如总是预测最频繁的 Action")
-    elif current_loss > 1.0:
-        print(f"    ⚠️  损失偏高（> 1.0），但优于 Baseline")
-    else:
-        print(f"    ✅ 损失正常（< 1.0）")
-
-# ============================================
-# 4. 检查可能的问题
-# ============================================
-print("\n" + "=" * 70)
-print("🎯 诊断结论")
-print("=" * 70)
-
-issues = []
-
-# 检查输出维度
-if model_path.exists() and output_layers:
-    for name, shape in output_layers.items():
-        if shape[0] != 28:
-            issues.append(f"模型输出维度 {shape[0]} != 28")
-
-# 检查损失
-if current_loss > 3.0:
-    if abs(current_loss - random_baseline_loss) < 0.1:
-        issues.append("损失等于随机猜测，模型完全没学习")
-    else:
-        issues.append(f"损失异常高（{current_loss:.2f}）")
-
-# 检查数据分布
-if ratio > 10:
-    issues.append(f"数据分布严重不均（{ratio:.1f}:1）")
-
-if issues:
-    print("\n❌ 发现以下问题:")
-    for i, issue in enumerate(issues, 1):
-        print(f"  {i}. {issue}")
-
-    print("\n💡 可能的原因:")
-    print("  1. GNN 没有正确输出特征")
-    print("  2. 学习率设置不当")
-    print("  3. 数据预处理有误")
-    print("  4. 模型架构与任务不匹配")
-
-    print("\n🔧 建议:")
-    if abs(current_loss - random_baseline_loss) < 0.1:
-        print("  【紧急】模型完全没学习！")
-        print("  1. 检查 GNN 是否正确前向传播")
-        print("  2. 检查梯度是否正常更新")
-        print("  3. 尝试降低学习率")
-        print("  4. 检查数据加载是否正确")
-else:
-    print("\n✅ 未发现明显问题，但损失仍然偏高")
-    print("\n可能需要:")
-    print("  1. 增加训练 Epochs（当前 15）")
-    print("  2. 调整学习率")
-    print("  3. 检查 GNN 架构")
-
-print("=" * 70)
+    print("\n" + "=" * 60)
+    print("✅ 分析完成")
+    print("=" * 60)

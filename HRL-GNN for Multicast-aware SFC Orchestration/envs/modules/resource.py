@@ -472,17 +472,235 @@ class ResourceManager:
     def compute_qos_violation(self, *args):
         return None
 
-    def reset(self):
-        self.B.fill(self.B_cap)
-        self.C.fill(self.C_cap)
-        self.M.fill(self.M_cap)
+    # ==========================================================
+    # 🔥【补全缺失方法】修复 AttributeError
+    # ==========================================================
+    def get_neighbors(self, node: int) -> List[int]:
+        """获取节点的邻居索引"""
+        if node < 0 or node >= self.n:
+            return []
+        return np.where(self.topo[node] > 0)[0].tolist()
+
+    def check_node_resource(self, node: int, vnf_type: int, cpu_need: float = 0.0, mem_need: float = 0.0) -> bool:
+        """检查节点资源是否足够"""
+        if node < 0 or node >= self.n:
+            return False
+        # 如果未传入具体数值，默认检查是否大于0（或者由调用方保证传入值）
+        return self.C[node] >= cpu_need - 1e-5 and self.M[node] >= mem_need - 1e-5
+
+
+
+    def get_link_cost(self, u: int, v: int) -> float:
+        """获取链路开销 (默认跳数为1，可扩展为延迟或带宽倒数)"""
+        return 1.0
+
+    def get_node_features(self, nodes_on_tree):
+        """获取节点特征矩阵 (兼容旧版调用)"""
+        # 注意：这里返回的是简化的特征，用于非GNN模式或Fallback
+        # 实际 GNN 特征在 get_graph_state 中构建
+        feats = []
+        for i in range(self.n):
+            f = [
+                self.C[i] / self.C_cap,
+                self.M[i] / self.M_cap,
+                1.0 if i in nodes_on_tree else 0.0
+            ]
+            feats.append(f)
+        return np.array(feats, dtype=np.float32)
+
+    def get_edge_features(self):
+        """获取边特征 (兼容旧版调用)"""
+        return self.edge_index, torch.zeros((self.edge_index.shape[1], 5))
+
+    def has_link(self, u: int, v: int) -> bool:
+        """检查节点 u 和 v 之间是否有物理链路"""
+        if u < 0 or u >= self.n or v < 0 or v >= self.n:
+            return False
+        return self.topo[u, v] > 0
+
+        # ==========================================================
+        # 🔥【Resource Manager 最终版】支持带宽释放 & 安全Reset
+        # ==========================================================
+
+    def reset(self, hard=False):
+        """
+        Episode-level reset:
+        :param hard: 是否强制重置所有物理资源 (用于 Phase 切换或初始化)
+        """
+        if hard:
+            # 只有在初始化或显式要求时，才恢复满资源
+            self.B.fill(self.B_cap)
+            self.C.fill(self.C_cap)
+            self.M.fill(self.M_cap)
+            # logger.warning("⚠️ 执行了 HARD RESET，资源已回满")
+
+        # --- 常规 Episode Reset (Soft) ---
+        # 仅清理临时缓存，保留 C/M/B 的当前占用状态
         self.hvt_all.fill(0)
         self.link_ref_count.fill(0)
         self.vnf_sharing_map.clear()
         self._dest_dist_cache.clear()
+        self.vnf_instances = []
 
-        # 重新同步 Dict 引用
+        # 同步字典
         self.nodes['cpu'] = self.C
         self.nodes['memory'] = self.M
-        for k in self.links['bandwidth']:
-            self.links['bandwidth'][k] = self.B_cap
+
+        # 同步带宽 (防 IndexError)
+        if hasattr(self, 'edge_to_phys'):
+            for (u, v), pid in self.edge_to_phys.items():
+                if pid < len(self.B):
+                    self.links['bandwidth'][(u, v)] = self.B[pid]
+
+    # =========================================================
+    # 🔥 [新增] 资源释放接口 (修复版 - 带上限检查)
+    # =========================================================
+
+    def release_link_resource(self, u, v, bw_val):
+        """
+        [修复版] 释放链路资源 (兼容 B_cap 是 float 的情况)
+        """
+        # 1. 尝试通过映射查找物理链路
+        if hasattr(self, 'edge_to_phys'):
+            pid = self.edge_to_phys.get((u, v))
+            # 双向查找
+            if pid is None:
+                pid = self.edge_to_phys.get((v, u))
+
+            if pid is not None and pid < len(self.B):
+                # 获取该物理链路的上限
+                if hasattr(self.B_cap, '__getitem__'):
+                    limit_b = self.B_cap[pid]
+                else:
+                    limit_b = self.B_cap
+
+                # 归还带宽 (带上限保护)
+                self.B[pid] = min(limit_b, self.B[pid] + bw_val)
+
+                # 同步到 links 字典 (给 Env 及其它模块看)
+                if hasattr(self, 'links') and 'bandwidth' in self.links:
+                    current_bw = self.B[pid]
+                    if (u, v) in self.links['bandwidth']:
+                        self.links['bandwidth'][(u, v)] = current_bw
+                    if (v, u) in self.links['bandwidth']:
+                        self.links['bandwidth'][(v, u)] = current_bw
+                return
+
+        # 2. Fallback: 如果没有映射，直接操作 topology 矩阵或 links 字典
+        if hasattr(self, 'links') and 'bandwidth' in self.links:
+            # 假设上限是 1000.0 (或者从某处获取)
+            limit_b = 1000.0
+            if (u, v) in self.links['bandwidth']:
+                self.links['bandwidth'][(u, v)] = min(limit_b, self.links['bandwidth'][(u, v)] + bw_val)
+
+        elif hasattr(self, 'topology'):
+            # 假设上限是 1000.0
+            limit_b = 1000.0
+            self.topology[u][v] = min(limit_b, self.topology[u][v] + bw_val)
+
+    def release_node_resource(self, node_id, vnf_type, cpu_val, mem_val):
+        """
+        [修复版] 释放节点资源 (兼容 C_cap 是 float 的情况)
+        """
+        # --- 1. 归还 CPU ---
+        # 检查 C_cap 是数组还是标量
+        if hasattr(self.C_cap, '__getitem__'):
+            limit_c = self.C_cap[node_id]  # 数组：取对应节点的上限
+        else:
+            limit_c = self.C_cap  # 标量：直接使用统一上限
+
+        if hasattr(self, 'C'):
+            self.C[node_id] = min(limit_c, self.C[node_id] + cpu_val)
+
+        # --- 2. 归还 Memory ---
+        if hasattr(self.M_cap, '__getitem__'):
+            limit_m = self.M_cap[node_id]
+        else:
+            limit_m = self.M_cap
+
+        if hasattr(self, 'M'):
+            self.M[node_id] = min(limit_m, self.M[node_id] + mem_val)
+
+        # --- 3. 更新 VNF 计数 (如果有的话) ---
+        if hasattr(self, 'hvt_all'):
+            self.hvt_all[node_id, vnf_type] = max(0.0, self.hvt_all[node_id, vnf_type] - 1.0)
+
+        # --- 4. 同步观测状态 (给 Gym State 用) ---
+        if hasattr(self, 'nodes'):
+            if 'cpu' in self.nodes:
+                self.nodes['cpu'][node_id] = self.C[node_id]
+            if 'memory' in self.nodes:
+                self.nodes['memory'][node_id] = self.M[node_id]
+    # =========================================================
+    # 🔥 [新增] 资源分配接口 (支持 V9.1 真实扣费)
+    # =========================================================
+
+    def allocate_link_resource(self, u, v, bw_need):
+        """
+        扣除链路带宽资源
+        :param u: 起点节点 ID
+        :param v: 终点节点 ID
+        :param bw_need: 需要的带宽量
+        :return: bool (成功/失败)
+        """
+        # 1. 检查链路是否存在
+        if not self.has_link(u, v):
+            return False
+
+        # 2. 获取当前带宽 (兼容不同存储结构)
+        if hasattr(self, 'links') and 'bandwidth' in self.links:
+            # 结构 A: self.links['bandwidth'][(u,v)]
+            current_bw = self.links['bandwidth'].get((u, v), 0.0)
+
+            if current_bw >= bw_need:
+                self.links['bandwidth'][(u, v)] -= bw_need
+                return True
+            else:
+                return False
+
+        elif hasattr(self, 'topology'):
+            # 结构 B: 直接存储在矩阵中 (self.topology[u][v])
+            current_bw = self.topology[u][v]
+
+            if current_bw >= bw_need:
+                self.topology[u][v] -= bw_need
+                return True
+            else:
+                return False
+
+        return False
+
+    def allocate_node_resource(self, node_id, vnf_type, cpu_need, mem_need=0.0):
+        """
+        扣除节点计算资源
+        :param node_id: 节点 ID
+        :param vnf_type: VNF 类型 (部分逻辑可能需要)
+        :param cpu_need: CPU 需求
+        :param mem_need: 内存需求 (可选)
+        :return: bool (成功/失败)
+        """
+        # 1. 边界检查
+        if node_id < 0 or node_id >= self.n:
+            return False
+
+        # 2. 检查 CPU
+        # 假设 self.C 存储节点剩余 CPU 容量
+        if hasattr(self, 'C'):
+            if self.C[node_id] >= cpu_need:
+                self.C[node_id] -= cpu_need
+
+                # 3. 检查内存 (如果有)
+                if hasattr(self, 'M') and mem_need > 0:
+                    if self.M[node_id] >= mem_need:
+                        self.M[node_id] -= mem_need
+                    else:
+                        # 回滚 CPU 扣除
+                        self.C[node_id] += cpu_need
+                        return False
+
+                return True
+            else:
+                return False
+
+        # 如果没有资源管理属性，默认允许 (Fallback)
+        return True

@@ -1,12 +1,9 @@
 import torch
-import torch.nn as nn
-import numpy as np
 import pickle
 import os
 import time
-import inspect
 from envs.sfc_env import SFC_HIRL_Env
-from core.hrl.agent.agent import Agent
+from core.hrl.agent import Agent
 from utils.config_utils import load_config
 
 # ================= 你的配置区域 =================

@@ -1,332 +1,430 @@
-# trainer/phase3_rl_trainer.py (完整修复版)
+"""
+Phase 3 RL Trainer - Goal-Conditioned HRL + DAgger (修复版)
+===============================================================================
+修复内容：
+1. 🔧 select_action 调用接口匹配 (action_mask & 返回值解包)
+2. ✅ 进度条增强：新增 'Res' (资源剩余率)
+3. ✅ 资源监控：实时计算网络 CPU 和 Bandwidth 的平均剩余比例。
+===============================================================================
+"""
+
 import logging
 import numpy as np
+import random
 from pathlib import Path
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
+import torch
+from utils.visualizer import SFCVisualizer
 
 logger = logging.getLogger(__name__)
 
 
 class Phase3RLTrainer:
-    """
-    Phase 3: Pure Reinforcement Learning Trainer (修复版)
-
-    修复记录:
-    1. ✅ 修复 Epsilon 更新位置（不要在 while 循环内更新）
-    2. ✅ 保留所有诊断功能
-    """
+    """Phase 3: Goal-Conditioned RL Trainer with DAgger & Full Metrics"""
 
     def __init__(self, env, agent, output_dir, config):
-
         self.env = env
         self.agent = agent
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.cfg = config
 
+        # 🔥 初始化可视化器
+        self.visualizer = None
+        if hasattr(env, 'topo'):
+            try:
+                self.visualizer = SFCVisualizer(env.topo, output_dir)
+                logger.info("🎨 可视化器已就绪 (plots 将保存在 outputs/checkpoints/plots)")
+            except Exception as e:
+                logger.warning(f"⚠️ 可视化器初始化失败: {e}")
+
         phase3_cfg = config.get("phase3", {})
         self.max_episodes = phase3_cfg.get("episodes", 1000)
         self.save_freq = phase3_cfg.get("save_every", 100)
         self.eval_freq = phase3_cfg.get("eval_every", 50)
 
-        # Epsilon 配置
+        # 1. Epsilon 配置
         epsilon_cfg = phase3_cfg.get("epsilon", {})
         self.epsilon_initial = epsilon_cfg.get("initial", 0.5)
-        self.epsilon_final = epsilon_cfg.get("final", 0.05)
-        self.epsilon_decay_steps = epsilon_cfg.get("decay_steps", 50000)
+        self.epsilon_final = epsilon_cfg.get("final", 0.01)
+        self.epsilon_decay_steps = epsilon_cfg.get("decay_steps", 5000)
 
-        # RL 配置
-        rl_cfg = phase3_cfg.get("rl", {})
-        buffer_cfg = rl_cfg.get("replay_buffer", {})
-        self.min_buffer_size = buffer_cfg.get("min_size", 1000)
-        self.batch_size = buffer_cfg.get("batch_size", 64)
+        # 2. DAgger 配置
+        dagger_cfg = phase3_cfg.get("dagger", {})
+        self.use_dagger = dagger_cfg.get("enabled", True)
+        self.beta = dagger_cfg.get("initial_beta", 0.8)
+        self.beta_final = dagger_cfg.get("final_beta", 0.05)
+        self.beta_decay_steps = dagger_cfg.get("decay_steps", 10000)
 
-        self.global_step = 0
+        self.min_buffer_size = 1000
 
-        # 详细统计
-        self.stats = {
-            "rewards": [],
-            "success_rate": [],
-            "losses": [],
-            "epsilon_history": [],
-            "step_rewards": [],
-            "episode_lengths": [],
-        }
-
+        # TensorBoard
         self.writer = SummaryWriter(log_dir=str(self.output_dir / "runs"))
 
-        # 诊断输出
-        logger.info("=" * 60)
-        logger.info("Phase 3 RL Trainer (PURE RL, NO EXPERT)")
-        logger.info(f"  Episodes: {self.max_episodes}")
-        logger.info(f"  Epsilon: {self.epsilon_initial} → {self.epsilon_final}")
-        logger.info(f"  Decay Steps: {self.epsilon_decay_steps}")
-        logger.info(f"  Min Buffer Size: {self.min_buffer_size}")
-        logger.info(f"  Batch Size: {self.batch_size}")
-
-        # 计算预期 Epsilon
-        ep100_eps = self._calculate_epsilon(100 * 120)
-        ep500_eps = self._calculate_epsilon(500 * 120)
-        logger.info(f"  预计 Ep 100 Epsilon: {ep100_eps:.4f}")
-        logger.info(f"  预计 Ep 500 Epsilon: {ep500_eps:.4f}")
-        logger.info("=" * 60)
+        # 统计信息
+        self.stats = {
+            "rewards": [],
+            "acceptance_rates": [],
+            "blocking_rates": [],
+            "resource_levels": [],  # 🔥 新增：资源剩余率记录
+            "losses": [],
+            "subgoal_completion_rate": [],
+            "intrinsic_rewards": [],
+            "total_arrived": [],
+            "total_accepted": [],
+            "total_completed": [],
+            "total_blocked": []
+        }
+        self.global_step = 0
 
     def _calculate_epsilon(self, steps):
-        """计算给定步数的 Epsilon 值"""
-        return self.epsilon_final + (self.epsilon_initial - self.epsilon_final) * \
-            np.exp(-steps / self.epsilon_decay_steps)
+        """计算 Epsilon"""
+        if steps >= self.epsilon_decay_steps:
+            return self.epsilon_final
+        decay_rate = (self.epsilon_initial - self.epsilon_final) / self.epsilon_decay_steps
+        return self.epsilon_initial - (decay_rate * steps)
 
-    def _update_epsilon(self):
-        """更新 Agent 的 Epsilon"""
-        epsilon = self._calculate_epsilon(self.global_step)
-        if hasattr(self.agent, 'epsilon'):
-            self.agent.epsilon = epsilon
-        elif hasattr(self.agent, 'set_epsilon'):
-            self.agent.set_epsilon(epsilon)
-        return epsilon
+    def _get_network_resource_level(self):
+        """🔥 计算当前网络的平均资源剩余率 (0% - 100%)"""
+        try:
+            rm = self.env.resource_mgr
+            # 1. CPU 剩余率 (平均)
+            avg_cpu = np.mean(rm.C) / np.mean(rm.C_cap)
+
+            # 2. 带宽 剩余率 (平均)
+            avg_bw = np.mean(rm.B) / np.mean(rm.B_cap)
+
+            # 3. 综合剩余率
+            return (avg_cpu + avg_bw) * 50.0  # (cpu + bw) / 2 * 100
+        except:
+            return 0.0
 
     def run(self):
-        logger.info("🚀 Starting Phase 3: Pure RL Training")
+        """运行训练主循环"""
+        logger.info(f"🚀 Starting Training: DAgger={self.use_dagger}, Beta={self.beta}")
+        self.env.set_dynamic_mode(True)
+        # 显式执行一次 Hard Reset 确保起点干净
+        if hasattr(self.env.resource_mgr, 'reset'):
+            self.env.resource_mgr.reset(hard=True)
 
-        # 尝试加载数据
-        if hasattr(self.env, "load_dataset"):
-            self.env.load_dataset("phase3")
+        self.env.reset()
+        # 确保数据加载
+        if hasattr(self.env, 'data_loader') and (not hasattr(self.env.data_loader, 'requests') or len(self.env.data_loader.requests) == 0):
+             if hasattr(self.env, "load_dataset"):
+                 self.env.load_dataset("phase3")
 
-        for ep in tqdm(range(self.max_episodes), desc="RL Training"):
+        pbar = tqdm(range(self.max_episodes), desc="RL Training")
+        for ep in pbar:
             try:
                 ep_reward, ep_info = self._run_episode(ep)
 
-                # 记录统计
+                # 1. 获取当前资源剩余量
+                curr_res_level = self._get_network_resource_level()
+
+                # 2. 更新统计列表
                 self.stats["rewards"].append(ep_reward)
-                self.stats["episode_lengths"].append(ep_info.get("steps", 0))
+                self.stats["acceptance_rates"].append(ep_info["acceptance_rate"])
+                self.stats["blocking_rates"].append(ep_info["blocking_rate"])
+                self.stats["resource_levels"].append(curr_res_level)
 
-                # TensorBoard 记录
-                self.writer.add_scalar("Reward/episode", ep_reward, ep)
-                self.writer.add_scalar("Metrics/episode_length", ep_info.get("steps", 0), ep)
+                if "subgoal_completion_rate" in ep_info:
+                    self.stats["subgoal_completion_rate"].append(ep_info["subgoal_completion_rate"])
 
-                # 每 10 个 Episode 输出详细信息
-                if ep % 10 == 0:
-                    acc_rate = (
-                            self.env.total_requests_accepted
-                            / max(1, self.env.total_requests_seen)
-                    )
-                    self.stats["success_rate"].append(acc_rate)
+                # 3. TensorBoard
+                self.writer.add_scalar("Train/Reward", ep_reward, ep)
+                self.writer.add_scalar("Train/AcceptanceRate", ep_info["acceptance_rate"], ep)
+                self.writer.add_scalar("Train/BlockingRate", ep_info["blocking_rate"], ep)
+                self.writer.add_scalar("Train/ResourceRemaining", curr_res_level, ep)
+                if hasattr(self.agent, 'epsilon_low'):
+                    self.writer.add_scalar("Train/Epsilon", self.agent.epsilon_low, ep)
+                self.writer.add_scalar("Train/Beta", self.beta, ep)
 
-                    current_epsilon = self.agent.get_epsilon() if hasattr(self.agent,
-                                                                          'get_epsilon') else self.agent.epsilon
+                # 4. 计算滑动平均 (最近50轮)
+                def get_avg(key):
+                    data = self.stats.get(key, [])
+                    recent = data[-50:]
+                    return sum(recent) / len(recent) if recent else 0.0
 
-                    # 计算最近 10 个 Episode 的平均奖励
-                    recent_rewards = self.stats["rewards"][-10:]
-                    avg_recent_reward = np.mean(recent_rewards) if recent_rewards else 0.0
+                avg_acc = get_avg("acceptance_rates")
+                avg_blk = get_avg("blocking_rates")
 
-                    # 计算平均 Loss
-                    recent_losses = self.stats["losses"][-100:]
-                    avg_loss = np.mean(recent_losses) if recent_losses else 0.0
+                # 5. 进度条更新
+                expert_usage_pct = ep_info.get('expert_usage', 0) * 100
+                pbar.set_postfix({
+                    "Rw": f"{ep_reward:.1f}",
+                    "Exp": f"{expert_usage_pct:.0f}%",
+                    "Acc": f"{avg_acc:.0f}%",
+                    "Blk": f"{avg_blk:.0f}%",
+                    "Res": f"{curr_res_level:.1f}%"
+                })
 
-                    self.writer.add_scalar("Metrics/acceptance_rate", acc_rate, ep)
-                    self.writer.add_scalar("Metrics/epsilon", current_epsilon, ep)
-                    self.writer.add_scalar("Metrics/avg_recent_reward", avg_recent_reward, ep)
-                    self.writer.add_scalar("Metrics/avg_loss", avg_loss, ep)
-
-                    # 详细日志
-                    logger.info(
-                        f"Ep {ep:4d} | "
-                        f"Reward {ep_reward:7.2f} (Avg10: {avg_recent_reward:7.2f}) | "
-                        f"AccRate {acc_rate:.2%} | "
-                        f"Eps {current_epsilon:.3f} | "
-                        f"Loss {avg_loss:.4f} | "
-                        f"Steps {ep_info.get('steps', 0):3d} | "
-                        f"BufferSize {len(self.agent.memory) if hasattr(self.agent, 'memory') else 'N/A'}"
-                    )
-
-                # 定期保存
-                if ep % self.save_freq == 0 and ep > 0:
-                    self.agent.save(self.output_dir / f"rl_model_ep{ep}.pth")
-
-                # 定期评估
-                if ep % self.eval_freq == 0 and ep > 0:
-                    eval_info = self._evaluate()
-                    self.writer.add_scalar("Eval/acceptance_rate", eval_info["acc_rate"], ep)
-                    logger.info(
-                        f"  📊 Eval | AvgReward {eval_info['avg_reward']:.2f} | AccRate {eval_info['acc_rate']:.2%}")
+                # 保存模型
+                if (ep + 1) % self.save_freq == 0:
+                    self.agent.save(str(self.output_dir / f"rl_model_ep{ep+1}.pth"))
 
             except Exception as e:
-                logger.error(f"❌ Phase3 Episode {ep} failed: {e}")
+                logger.error(f"❌ Episode {ep} failed: {e}")
                 import traceback
                 traceback.print_exc()
-
-        # 最终保存
-        self.agent.save(self.output_dir / "rl_model_final.pth")
-        self.writer.close()
-
-        # 最终统计
-        logger.info("=" * 60)
-        logger.info("✅ Phase 3 Training Complete")
-        logger.info(f"  Total Episodes: {len(self.stats['rewards'])}")
-        logger.info(f"  Final Avg Reward: {np.mean(self.stats['rewards'][-100:]):.2f}")
-        logger.info(f"  Final AccRate: {self.stats['success_rate'][-1]:.2%}" if self.stats['success_rate'] else "  N/A")
-        logger.info("=" * 60)
-
-        return self.stats
-
-    def _run_episode(self, ep: int):
-        """运行单个 Episode（最终清晰版：标记任务切换）"""
-
-        # 更新 Epsilon
-        current_epsilon = self._update_epsilon()
-
-        # 环境重置
-        reset_result = self.env.reset()
-        state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-
-        # 获取首个请求信息
-        req = self.env.current_request
-        src_node = req.get('source', 'Err') if req else 'Err'
-        dst_nodes = req.get('dest', []) if req else []
-
-        # 🔥 轨迹记录器：增加 Request ID 标记
-        req_id = req.get('id', 0) if req else 0
-        real_trajectory = [f"R{req_id}:Start({src_node})"]
-
-        if req is None: return 0.0, {"steps": 0}
-
-        done = False
-        ep_reward = 0.0
-        ep_steps = 0
-
-        while not done:
-            # Mask & Action
-            high_mask = self.env.get_high_level_action_mask()
-            low_mask = self.env.get_low_level_action_mask()
-            masks = (high_mask, low_mask)
-
-            high_act, low_act = self.agent.select_action(state, masks=masks)
-
-            # Step
-            _, r_h, _, _ = self.env.step_high_level(high_act)
-            step_result = self.env.step_low_level(low_act)
-
-            if len(step_result) == 5:
-                next_state, r_l, terminated, truncated, info = step_result
-                done = terminated or truncated
-            else:
-                next_state, r_l, done, info = step_result
-
-            # ====================================================
-            # 🔥 日志逻辑优化
-            # ====================================================
-            if info and not info.get('error'):
-                act_type = info.get('action_type', 'unknown')
-
-                if act_type == 'move':
-                    target = info.get('to', int(low_act))
-                    real_trajectory.append(f"→{target}")
-
-                elif act_type == 'deploy':
-                    node = info.get('node', int(low_act))
-                    real_trajectory.append(f"★Dep({node})")
-
-                    # 🔥 检查是否完成了当前请求
-                    if info.get('all_deployed'):
-                        real_trajectory.append("✅Done")
-
-                        # 如果还有下一个请求，标记新起点
-                        if not done:
-                            next_req = self.env.current_request
-                            if next_req:
-                                new_src = next_req.get('source')
-                                new_id = next_req.get('id', '?')
-                                real_trajectory.append(f" || 🆕 R{new_id}:Start({new_src})")
-
-            # Store & Update
-            next_high_mask = self.env.get_high_level_action_mask()
-            next_low_mask = self.env.get_low_level_action_mask()
-
-            self.agent.store_transition(
-                state, (high_act, low_act), r_l, next_state, done,
-                next_valid_mask=(next_high_mask, next_low_mask)
-            )
-
-            buffer_size = len(self.agent.memory) if hasattr(self.agent, 'memory') else 0
-            if buffer_size >= self.min_buffer_size:
-                loss = self.agent.update()
-                # (Optional) Log loss...
-
-            state = next_state
-            ep_reward += r_l
-            ep_steps += 1
-            self.global_step += 1
-
-            if ep_steps > 100: break
-
-        # ====================================================
-        # 🔥 打印最终清晰路径
-        # ====================================================
-        # 只要跑完了(无论成功失败)，只要步数大于1就打印看看
-        if ep < 3 or (ep % 10 == 0):
-            # 统计总共完成了多少个请求
-            completed_reqs = path_str = "".join(real_trajectory).count("✅Done")
-
-            logger.info("-" * 60)
-            logger.info(f"Ep {ep} Summary | Steps: {ep_steps} | Reqs Completed: {completed_reqs}")
-
-            # 分行打印路径，太长了很难看
-            # 将路径按请求分割打印
-            full_str = " ".join(real_trajectory)
-            segments = full_str.split("||")
-
-            logger.info("👣 轨迹详情:")
-            for seg in segments:
-                logger.info(f"   {seg.strip()}")
-
-            logger.info(f"💰 总奖励: {ep_reward:.2f}")
-            logger.info("-" * 60)
-
-        return ep_reward, {"steps": ep_steps}
-    def _evaluate(self, num_episodes: int = 5):
-        """评估模型性能"""
-        self.agent.eval()
-        rewards = []
-
-        for _ in range(num_episodes):
-            reset_result = self.env.reset()
-            state = reset_result[0] if isinstance(reset_result, tuple) else reset_result
-            if self.env.current_request is None:
                 continue
 
-            done = False
-            ep_reward = 0.0
+        self.agent.save(str(self.output_dir / "rl_model_final.pth"))
+        logger.info("✅ Phase 3 Training Complete")
 
-            # 临时关闭 epsilon
-            old_eps = self.agent.epsilon if hasattr(self.agent, 'epsilon') else 0.0
-            if hasattr(self.agent, 'epsilon'):
-                self.agent.epsilon = 0.0
+    def _run_episode(self, episode_idx: int):
+        """
+        运行一个episode（集成黑名单）
 
-            while not done:
-                high_mask = self.env.get_high_level_action_mask()
-                low_mask = self.env.get_low_level_action_mask()
+        主要修改：
+        1. 从环境获取action_mask和blacklist_info
+        2. 智能专家判断（检查Mask）
+        3. 传入blacklist_info到Agent
+        4. 记录失败节点
+        5. Episode统计中添加黑名单信息
+        """
+        import numpy as np
+        import random
 
-                high_act, low_act = self.agent.select_action(state, masks=(high_mask, low_mask))
+        # ✅ 重置环境，获取初始mask和黑名单
+        state, reset_info = self.env.reset()
+        action_mask = reset_info.get('action_mask')
+        blacklist_info = reset_info.get('blacklist_info', {})
 
-                self.env.step_high_level(high_act)
-                step_result = self.env.step_low_level(low_act)
+        # 获取初始目标列表
+        unconnected_dests = self._get_current_destinations()
 
-                if len(step_result) == 5:
-                    next_state, r_l, term, trunc, _ = step_result
-                    done = term or trunc
+        done = False
+        steps = 0
+        episode_reward = 0
+        max_steps = self.config.get('max_steps_per_episode', 1000)
+
+        # Episode统计
+        expert_steps = 0
+        agent_steps = 0
+        masked_expert_steps = 0  # 被过滤的专家建议次数
+
+        while not done and steps < max_steps:
+            # ============================================
+            # ✅ 智能专家判断（检查Mask）
+            # ============================================
+            use_expert = False
+            expert_action = None
+
+            if self.use_dagger and random.random() < self.beta:
+                # 获取专家建议
+                expert_suggestion = self._get_expert_action(state)
+
+                # ✅ 检查专家建议是否被Mask
+                if action_mask is None:
+                    # 没有mask，直接使用
+                    use_expert = True
+                    expert_action = expert_suggestion
+                    expert_steps += 1
+                    logger.debug(f"✅ 采用专家建议: {expert_action}")
                 else:
-                    next_state, r_l, done, _ = step_result
+                    # 有mask，需要检查
+                    valid_actions = np.where(action_mask > 0)[0]
 
-                ep_reward += r_l
-                state = next_state
+                    if expert_suggestion in valid_actions:
+                        # 专家建议有效
+                        use_expert = True
+                        expert_action = expert_suggestion
+                        expert_steps += 1
+                        logger.debug(f"✅ 采用专家建议: {expert_action}")
+                    else:
+                        # 专家建议被Mask
+                        use_expert = False
+                        masked_expert_steps += 1
+                        logger.debug(
+                            f"⚠️ 专家建议{expert_suggestion}被Mask "
+                            f"(valid: {valid_actions[:5] if len(valid_actions) > 0 else 'none'})"
+                        )
 
-            rewards.append(ep_reward)
+            # ============================================
+            # ✅ Agent选择动作（传入黑名单信息）
+            # ============================================
+            high_action, low_action, action_info = self.agent.select_action(
+                state=state,
+                unconnected_dests=unconnected_dests,
+                action_mask=action_mask,
+                use_expert=use_expert,
+                expert_action=expert_action,
+                blacklist_info=blacklist_info  # 🚀 传入黑名单
+            )
 
-            # 恢复 epsilon
-            if hasattr(self.agent, 'epsilon'):
-                self.agent.epsilon = old_eps
+            # 统计Agent步数
+            if not use_expert:
+                agent_steps += 1
 
-        self.agent.train()
-        acc_rate = self.env.total_requests_accepted / max(1, self.env.total_requests_seen)
-        return {"avg_reward": np.mean(rewards), "acc_rate": acc_rate}
+            # ============================================
+            # 执行动作
+            # ============================================
+            next_state, reward, done, truncated, step_info = self.env.step(low_action)
+
+            # ✅ 记录失败
+            if not step_info.get('success', True):
+                reason = step_info.get('message', 'unknown')
+                if "资源不足" in reason or "访问超限" in reason:
+                    self.agent.record_failure(low_action, reason)
+                    logger.debug(f"📝 记录失败: 节点{low_action}, 原因:{reason}")
+
+            # ============================================
+            # 存储经验
+            # ============================================
+            if action_info.get('source', '').startswith('agent'):
+                # High-Level经验
+                if action_info.get('high_level_decision', False):
+                    goal = unconnected_dests[high_action] if unconnected_dests and high_action < len(
+                        unconnected_dests) else -1
+                    self.agent.store_transition_high(
+                        state, goal, reward, next_state, done or truncated
+                    )
+
+                # Low-Level经验
+                self.agent.store_transition_low(
+                    state, low_action, reward, next_state, done or truncated
+                )
+
+            # ============================================
+            # ✅ 更新状态和黑名单信息
+            # ============================================
+            state = next_state
+            action_mask = step_info.get('action_mask')
+            blacklist_info = step_info.get('blacklist_info', {})
+
+            # 更新未连接目标列表
+            unconnected_dests = self._get_current_destinations()
+
+            episode_reward += reward
+            steps += 1
+
+            # 定期更新策略
+            if hasattr(self, 'update_frequency') and steps % self.update_frequency == 0:
+                losses = self.agent.update_policies()
+
+                # 记录损失
+                if hasattr(self, 'writer'):
+                    if losses.get('low_loss', 0) > 0:
+                        self.writer.add_scalar('Loss/low', losses['low_loss'], self.global_step)
+                    if losses.get('high_loss', 0) > 0:
+                        self.writer.add_scalar('Loss/high', losses['high_loss'], self.global_step)
+
+                if hasattr(self, 'global_step'):
+                    self.global_step += 1
+
+            # 检查是否因超时而终止
+            if truncated:
+                done = True
+
+        # ============================================
+        # ✅ Episode总结（包含黑名单统计）
+        # ============================================
+        blacklist_stats = self.agent.get_blacklist_learning_stats()
+
+        # 基本统计
+        logger.info(
+            f"Episode {episode_idx}: "
+            f"Steps={steps}, Reward={episode_reward:.2f}, "
+            f"Expert={expert_steps}, Agent={agent_steps}, "
+            f"MaskedExpert={masked_expert_steps}"
+        )
+
+        # 黑名单统计
+        if blacklist_info.get('total', 0) > 0:
+            logger.info(
+                f"  📋 黑名单: {blacklist_info['total']}个节点 "
+                f"{blacklist_info.get('nodes', [])[:5]}"
+            )
+
+        # Agent学习统计
+        if blacklist_stats['total_failures'] > 0:
+            logger.info(
+                f"  📊 失败统计: {blacklist_stats['total_failures']}次, "
+                f"{blacklist_stats['unique_failed_nodes']}个不同节点"
+            )
+
+            if blacklist_stats['top_failed_nodes']:
+                top3 = blacklist_stats['top_failed_nodes'][:3]
+                logger.info(f"  🔥 最常失败: {[(n['node'], n['count']) for n in top3]}")
+
+        # ============================================
+        # 返回Episode统计
+        # ============================================
+        return {
+            'steps': steps,
+            'reward': episode_reward,
+            'success': step_info.get('request_completed', False),
+            'expert_ratio': expert_steps / steps if steps > 0 else 0,
+            'agent_ratio': agent_steps / steps if steps > 0 else 0,
+            'masked_expert_ratio': masked_expert_steps / steps if steps > 0 else 0,
+            'blacklist_size': blacklist_info.get('total', 0),
+            'total_failures': blacklist_stats.get('total_failures', 0)
+        }
+
+    def _update_parameters(self):
+        if hasattr(self.agent, 'update_epsilon'): self.agent.update_epsilon()
+        if self.use_dagger:
+            decay = (self.beta - self.beta_final) / self.beta_decay_steps
+            self.beta = max(self.beta_final, self.beta - decay)
+
+    def _empty_stats(self):
+        return {
+            "steps": 0, "acceptance_rate": 0.0, "blocking_rate": 0.0,
+            "expert_usage": 0.0, "subgoal_completion_rate": 0.0, "avg_intrinsic_reward": 0.0,
+            "completion_rate": 0.0, "total_arrived": 0, "total_accepted": 0, "total_completed": 0, "total_blocked": 0
+        }
+
+    def _log_episode_summary(self, ep, steps, reward, completed, expert_uses, trajectory):
+        status = "✅ Success" if completed else "❌ Failed"
+        logger.info("-" * 60)
+        logger.info(f"Ep {ep} | {status} | Rw: {reward:.2f} | Exp: {expert_uses} ({expert_uses/max(1, steps)*100:.1f}%)")
+        traj_str = " ".join(trajectory[-15:])
+        logger.info(f"👣 ... {traj_str}")
+        logger.info("-" * 60)
+
+    def _get_current_destinations(self):
+        """
+        获取当前未连接的目的地列表
+
+        Returns:
+            List[int]: 未连接目的地节点ID列表
+        """
+        if not hasattr(self.env, 'current_request') or self.env.current_request is None:
+            return []
+
+        # 获取所有目的地
+        all_dests = self.env.current_request.get('dest', [])
+
+        # 获取已连接的目的地
+        connected = self.env.current_tree.get('connected_dests', set())
+
+        # 返回未连接的
+        unconnected = [d for d in all_dests if d not in connected]
+
+        return unconnected
+
+    # ============================================
+    # 辅助方法：获取专家动作
+    # ============================================
+    def _get_expert_action(self, state):
+        """
+        获取专家动作
+
+        Args:
+            state: 当前状态
+
+        Returns:
+            int: 专家建议的动作
+        """
+        if not hasattr(self, 'expert_policy') or self.expert_policy is None:
+            # 没有专家，返回随机动作
+            return random.randint(0, self.env.n - 1)
+
+        try:
+            # 调用专家策略
+            action = self.expert_policy.get_action(state)
+            return int(action)
+        except Exception as e:
+            logger.warning(f"⚠️ 专家策略出错: {e}")
+            return random.randint(0, self.env.n - 1)

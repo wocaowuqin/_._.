@@ -4,22 +4,29 @@ phase3:
   episodes: 1000
   max_steps: 3000000
   start_epsilon: 0.5  # 🔥 提升初始探索率
-  max_steps_per_episode: 120
+  max_steps_per_episode: 600
   eval_every: 100
   eval_episodes: 20
   save_every: 100
+# 黑名单管理配置
+blacklist:
+  cooldown_base: 5          # 基础冷却时间（步数）
+  cooldown_max: 20          # 最大冷却时间（步数）
+  cooldown_multiplier: 2    # 失败次数增长系数
+  cleanup_interval: 3       # 清理间隔（步数）
+  min_valid_actions: 3      # 最小可用动作数（触发应急清理）
 
   # 🔥 探索策略（重点修复）
   epsilon:
     initial: 0.3        # 从 50% 探索开始
-    final: 0.05         # 最终保持 5% 探索
+    final: 0.05        # 最终保持 5% 探索
     decay_steps: 50000  # 🔥 500 个 Episode (假设每个 100 步)
 
   # DAgger配置
   dagger:
-    initial_beta: 0.8
-    final_beta: 0.05
-    decay_steps: 100000  # 🔥 也相应调整
+    initial_beta: 0.5
+    final_beta: 0.1
+    decay_steps: 50000  # 🔥 也相应调整
 
   # 早停策略
   early_stopping:
@@ -50,3 +57,55 @@ phase3:
       min_size: 1000      # 🔥 新增：1000 个样本后开始学习
     target_update_freq: 200  # 🔥 改成 100 步更新一次
     learning_rate: 0.0001    # 🔥 新增：学习率
+
+  # Goal-Conditioned HRL 配置
+  hrl:
+    goal_dim: 64
+    subgoal_horizon: 5
+    intrinsic_reward_weight: 0.3
+    max_complexity_threshold: 0.8
+    goal_strategy: 'adaptive'
+
+  # configs/phase3.yaml
+
+  # ... 你现有的其他配置 ...
+
+  # ============================================
+  # 奖励函数配置
+  # ============================================
+reward:
+  # VNF部署
+  vnf_deploy_success: 40.0
+  vnf_all_complete: 50.0
+  vnf_deploy_failed: -30.0
+  move_to_dc_bonus: 5.0
+  move_cost: -0.1
+
+  # 树构建
+  connection_base: 50.0
+  connection_exponential: 1.5
+  connection_progress_bonus: 50.0
+  dest_reached_bonus: 30.0
+  full_completion_bonus: 300.0
+
+  # 🔥 加强距离引导
+  guidance_closer_rate: 3.0
+  guidance_farther_penalty: -1.0
+  guidance_idle_penalty: -0.5
+
+  # 惩罚
+  invalid_link: -10.0
+  invalid_action: -15.0
+  wrong_position: -5.0
+
+  # 🔥 几乎取消频次惩罚
+  freq_penalty_threshold: 20
+  freq_penalty_rate: -1
+
+  # 超时
+  timeout_high_progress_threshold: 0.8
+  timeout_bonus_rate: 50.0
+  timeout_penalty_rate: 50.0
+  vnf_timeout_penalty: -50.0
+
+  reward_scale: 1.0

@@ -1,13 +1,12 @@
 # reward_critic.py
 """
-Reward Critic Module for Multicast VNF Mapping (完整修复版)
+Reward Critic Module for Multicast VNF Mapping (终极扩展版)
 
-修复记录:
-1. ✅ 添加全局奖励缩放 (reward_scale = 0.1)
-2. ✅ 修复归一化基准 (max_cpu=100, max_bw=1000)
-3. ✅ 调整奖励比例 (full_accept_bonus=5.0)
-4. ✅ 增强惩罚力度 (invalid_penalty=-2.0)
-5. ✅ 添加 hops 参数支持
+功能特性:
+1. ✅ 统一管理 VNF 部署与树构建的所有奖励参数
+2. ✅ 支持指数级连接奖励 (50 * 1.5^n)
+3. ✅ 支持距离引导奖励 (Distance Guidance)
+4. ✅ 兼容原有的保存/加载/诊断接口
 """
 
 import logging
@@ -23,54 +22,62 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RewardCriticParams:
-    """奖励函数参数配置 (完整修复版)"""
+    """奖励函数参数配置 - 扩展版"""
 
     # ========================================
-    # 核心权重
+    # 1. VNF 部署阶段 (Phase A)
     # ========================================
+    vnf_deploy_success: float = 40.0  # 单个 VNF 部署成功
+    vnf_all_complete: float = 50.0  # 所有 VNF 部署完成
+    vnf_deploy_failed: float = -30.0  # 部署失败（资源不足）
+
+    move_to_dc_bonus: float = 5.0  # 移动到 DC 节点
+    move_cost: float = -0.1  # 基础移动成本
+
+    # ========================================
+    # 2. 树构建阶段 (Phase B)
+    # ========================================
+    # 连接奖励公式: base * (exponential ^ (n-1)) + progress_bonus * ratio
+    connection_base: float = 60.0  # 基础连接奖励
+    connection_exponential: float = 1.5  # 指数增长系数 (鼓励连得越多奖励越大)
+    connection_progress_bonus: float = 50.0  # 进度奖励基数
+
+    dest_reached_bonus: float = 30.0  # 仅仅到达目的节点（未连接）
+    full_completion_bonus: float = 300.0  # 任务完美完成大奖
+
+    # ========================================
+    # 3. 导航与引导 (Guidance)
+    # ========================================
+    guidance_closer_rate: float = 5.0  # 向目标靠近一步
+    guidance_farther_penalty: float = -2.0  # 远离目标一步
+    guidance_idle_penalty: float = -0.5  # 原地不动/平移
+
+    # ========================================
+    # 4. 惩罚项 (Penalties)
+    # ========================================
+    invalid_link: float = -10.0  # 非法移动/断路
+    invalid_action: float = -15.0  # 被 Mask 禁止的动作
+    wrong_position: float = -5.0  # 在错误位置尝试操作
+
+    # 频次惩罚 (防止死循环)
+    freq_penalty_threshold: int = 5  # 阈值
+    freq_penalty_rate: float = -2.0  # 惩罚系数
+
+    # ========================================
+    # 5. 超时处理 (Timeout)
+    # ========================================
+    timeout_high_progress_threshold: float = 0.8  # 高进度门槛
+    timeout_bonus_rate: float = 50.0  # 高进度结算奖励
+    timeout_penalty_rate: float = 50.0  # 低进度惩罚
+    vnf_timeout_penalty: float = -50.0  # 第一阶段超时惩罚
+
+    # ========================================
+    # 6. 旧版兼容 / 归一化 (保留以防报错)
+    # ========================================
+    reward_scale: float = 1.0  # 全局缩放 (默认1.0表示不缩放)
     w_cpu: float = 0.33
     w_bw: float = 0.34
     w_hop: float = 0.33
-
-    # ========================================
-    # 🔥 单步奖励缩放
-    # ========================================
-    step_scale: float = 0.25
-
-    # ========================================
-    # 🔥🔥🔥 全局奖励缩放（关键修复）
-    # ========================================
-    reward_scale: float = 0.1
-
-    # 作用：所有奖励最后乘以此值
-    # 效果：Episode 奖励从 320 降到 32
-    #       Loss 从 15 降到 5
-
-    # ========================================
-    # 惩罚参数
-    # ========================================
-    backup_penalty: float = 0.1
-    invalid_penalty: float = -2.0  # 加大惩罚
-    loop_penalty: float = -1.5  # 加大惩罚
-
-    # ========================================
-    # 任务结算
-    # ========================================
-    subtask_success: float = 2.0
-    full_accept_bonus: float = 5.0  # 从 20.0 降到 5.0
-    request_fail_penalty: float = 3.0
-
-    # ========================================
-    # 归一化基准（已修复）
-    # ========================================
-    max_cpu: float = 80.0  # 恢复正确值
-    max_bw: float = 80.0  # 恢复正确值
-    max_hops: float = 10.0
-
-    # ========================================
-    # 裁剪范围
-    # ========================================
-    step_clip: Tuple[float, float] = (-3.0, 3.0)
 
 
 @dataclass
@@ -80,18 +87,16 @@ class CriticDiagnostics:
     avg_reward: float
     request_count: int
     success_rate: float
-    avg_bandwidth: float
-    avg_hops: float
 
 
 class RewardCritic:
     """
-    Multicast VNF Reward Critic (完整修复版)
+    扩展版 RewardCritic - 支持 VNF 部署 + 树构建完整流程
     """
 
     def __init__(self,
-                 training_phase: int = 1,
-                 params: Optional[Union[Dict[str, Any], RewardCriticParams]] = None):
+                 training_phase: int = 3,
+                 params: Optional[Union[Dict, RewardCriticParams]] = None):
 
         self.phase = int(training_phase)
 
@@ -99,195 +104,207 @@ class RewardCritic:
         if params is None:
             self.params = RewardCriticParams()
         elif isinstance(params, dict):
-            self.params = RewardCriticParams(**params)
+            # 过滤掉不匹配的键，防止报错
+            valid_keys = RewardCriticParams.__annotations__.keys()
+            filtered_params = {k: v for k, v in params.items() if k in valid_keys}
+            self.params = RewardCriticParams(**filtered_params)
         else:
             self.params = params
 
         # 运行时状态
         self._buffer_reward = 0.0
         self._request_active = False
-        self._current_request_id: Optional[str] = None
 
-        # 统计数据容器
+        # 统计历史
         self.reward_history: List[float] = []
-        self.bw_history: List[float] = []
-        self.hop_history: List[int] = []
+        self.history_len = 1000  # 限制历史长度防止内存泄漏
 
-        self.debug = False
-        self._cached_params = asdict(self.params)
-
-    # ---------------------------------------------------------
-    # 核心计算逻辑
-    # ---------------------------------------------------------
-    def _normalize(self, value: float, max_val: float) -> float:
-        """归一化工具"""
-        if max_val <= 0:
-            return 0.0
-        return float(np.clip(value / max_val, 0.0, 1.0))
-
-    def _calculate_step_reward(self,
-                               cpu_remain: float = 0.0,
-                               bandwidth: float = 0.0,
-                               hops: int = 1,
-                               is_node_action: bool = False,
-                               backup_used: bool = False,
-                               is_loop: bool = False) -> float:
+    # =========================================================================
+    # VNF 部署阶段奖励计算
+    # =========================================================================
+    def compute_vnf_deploy_reward(self,
+                                  success: bool,
+                                  all_complete: bool = False,
+                                  quality_score: float = 0.0) -> float:
         """
-        计算单步奖励（对齐论文公式）
+        计算 VNF 部署动作的奖励
+        :param success: 是否部署成功
+        :param all_complete: 是否所有 VNF 都部署完毕
+        :param quality_score: 部署位置质量加成 (例如基于 AvgHops)
+        """
+        p = self.params
+        if success:
+            reward = p.vnf_deploy_success + quality_score
+            if all_complete:
+                reward += p.vnf_all_complete
+            return reward * p.reward_scale
+        else:
+            return p.vnf_deploy_failed * p.reward_scale
 
-        论文公式：
-        Rstep = β1·cpu + β2·bw - β3·hops
+    def compute_vnf_move_reward(self,
+                                to_dc: bool = False,
+                                valid_link: bool = True,
+                                guidance_val: float = 0.0) -> float:
+        """
+        计算 VNF 阶段移动奖励
+        :param to_dc: 是否移动到了 DC 节点
+        :param valid_link: 是否是有效链路
+        :param guidance_val: 额外的引导分 (由 Env 计算距离产生)
+        """
+        p = self.params
+        if not valid_link:
+            return p.invalid_link * p.reward_scale
+
+        reward = p.move_cost + guidance_val
+        if to_dc:
+            reward += p.move_to_dc_bonus
+
+        return reward * p.reward_scale
+
+    # =========================================================================
+    # 树构建阶段奖励计算
+    # =========================================================================
+    def compute_tree_connection_reward(self,
+                                       connected_count: int,
+                                       total_dests: int,
+                                       is_complete: bool = False) -> float:
+        """
+        计算连接动作奖励 (指数递增)
+        :param connected_count: 当前已连接节点数 (含本次)
+        :param total_dests: 总目的节点数
+        :param is_complete: 是否全部连接完成
         """
         p = self.params
 
-        # 1. 基础惩罚检查
-        if is_loop:
-            return p.loop_penalty
-        if backup_used:
-            return -p.backup_penalty
+        # 1. 基础指数奖励: 60 * 1.5^(n-1)
+        # n=1: 60, n=2: 90, n=3: 135, n=4: 202, n=5: 303
+        base = p.connection_base * (p.connection_exponential ** (connected_count - 1))
 
-        # 2. 归一化
-        norm_cpu = self._normalize(cpu_remain, p.max_cpu)
-        norm_bw = self._normalize(bandwidth, p.max_bw)
-        norm_hops = self._normalize(hops, p.max_hops)
+        # 2. 进度奖励 (线性)
+        ratio = connected_count / total_dests if total_dests > 0 else 0
+        progress = p.connection_progress_bonus * ratio
 
-        # 3. 计算原始奖励
-        if is_node_action:
-            # Meta Controller: 重点关注节点资源
-            raw_reward = p.w_cpu * norm_cpu
+        reward = base + progress
+
+        # 3. 完美通关大奖
+        if is_complete:
+            reward += p.full_completion_bonus
+
+        return reward * p.reward_scale
+
+    def compute_tree_move_reward(self,
+                                 to_dest: bool = False,
+                                 valid_link: bool = True,
+                                 min_dist_before: int = 999,
+                                 min_dist_after: int = 999) -> float:
+        """
+        计算树构建阶段移动奖励 (含距离引导)
+        """
+        p = self.params
+        if not valid_link:
+            return p.invalid_link * p.reward_scale
+
+        reward = p.move_cost
+
+        # 到达目的节点但未连接 (踩中)
+        if to_dest:
+            reward += p.dest_reached_bonus
+
+        # 🔥 距离引导逻辑
+        if min_dist_after < min_dist_before:
+            # 靠近了: +5.0
+            reward += p.guidance_closer_rate
+        elif min_dist_after > min_dist_before:
+            # 远离了: -2.0
+            reward += p.guidance_farther_penalty
         else:
-            # Intrinsic Controller: 带宽 - 跳数成本
-            raw_reward = (p.w_bw * norm_bw) - (p.w_hop * norm_hops)
+            # 平移/原地: -0.5
+            reward += p.guidance_idle_penalty
 
-        # 4. 单步奖励缩放
-        reward = raw_reward * p.step_scale
+        return reward * p.reward_scale
 
-        # 5. 裁剪
-        lo, hi = p.step_clip
-        return float(np.clip(reward, lo, hi))
+    def compute_frequency_penalty(self, visit_count: int, is_hub: bool = False) -> float:
+        """计算频次惩罚"""
+        p = self.params
+        if is_hub or visit_count <= p.freq_penalty_threshold:
+            return 0.0
 
-    # ---------------------------------------------------------
-    # 对外接口
-    # ---------------------------------------------------------
-    def criticize(self,
-                  request_failed: bool = False,
-                  sub_task_completed: bool = False,
-                  request_completed: bool = False,
+        excess = visit_count - p.freq_penalty_threshold
+        # 例如: 访问 6 次 (超 1 次) -> -2.0
+        return (p.freq_penalty_rate * excess) * p.reward_scale
 
-                  # 关键状态参数
-                  cpu_remain: float = 0.0,
-                  bandwidth: float = 0.0,
-                  hops: int = 1,
-                  is_meta_step: bool = False,
-                  is_loop: bool = False,
-                  backup_used: bool = False,
+    # =========================================================================
+    # 超时与结算
+    # =========================================================================
+    def compute_timeout_reward(self,
+                               in_vnf_phase: bool,
+                               connected_count: int = 0,
+                               total_dests: int = 1) -> float:
+        """计算超时奖励/惩罚"""
+        p = self.params
 
-                  **kwargs) -> float:
+        # 第一阶段就挂了
+        if in_vnf_phase:
+            return p.vnf_timeout_penalty * p.reward_scale
+
+        # 第二阶段超时，根据进度给分
+        ratio = connected_count / total_dests if total_dests > 0 else 0
+
+        if ratio >= p.timeout_high_progress_threshold:
+            # 高进度 (>80%)，虽败犹荣，给奖励
+            return (p.timeout_bonus_rate * ratio) * p.reward_scale
+        else:
+            # 低进度，惩罚
+            penalty = min(100.0, p.timeout_penalty_rate * (1.0 - ratio))
+            return -penalty * p.reward_scale
+
+    # =========================================================================
+    # 统一调用接口 (可选)
+    # =========================================================================
+    def get_reward(self, phase: str, **kwargs) -> float:
         """
-        计算并返回当前步的奖励（包含全局归一化）
+        统一接口，根据 phase 自动分发
+        :param phase: 'vnf_deploy', 'vnf_move', 'tree_connect', 'tree_move', 'timeout'
         """
-        # 1. 自动初始化请求
-        if not self._request_active:
-            self.on_new_request()
+        if phase == 'vnf_deploy':
+            return self.compute_vnf_deploy_reward(**kwargs)
+        elif phase == 'vnf_move':
+            return self.compute_vnf_move_reward(**kwargs)
+        elif phase == 'tree_connect':
+            return self.compute_tree_connection_reward(**kwargs)
+        elif phase == 'tree_move':
+            return self.compute_tree_move_reward(**kwargs)
+        elif phase == 'timeout':
+            return self.compute_timeout_reward(**kwargs)
+        elif phase == 'penalty':
+            # 通用惩罚 (如非法动作)
+            t = kwargs.get('type', 'invalid_action')
+            val = getattr(self.params, t, -10.0)
+            return val * self.params.reward_scale
+        return 0.0
 
-        # 2. 处理请求失败
-        if request_failed:
-            fail_reward = -self.params.request_fail_penalty
-            # 🔥 应用全局缩放
-            fail_reward *= self.params.reward_scale
+    # =========================================================================
+    # 辅助功能 (保存/加载/诊断)
+    # =========================================================================
+    def record_step(self, reward: float):
+        """记录单步奖励到 buffer (可选)"""
+        self._buffer_reward += reward
 
-            if self.debug:
-                logger.debug(f"请求失败惩罚: {fail_reward}")
-
-            self.on_request_done(success=False, final_reward_override=fail_reward)
-            return fail_reward
-
-        # 3. 计算单步奖励
-        step_reward = self._calculate_step_reward(
-            cpu_remain=cpu_remain,
-            bandwidth=bandwidth,
-            hops=hops,
-            is_node_action=is_meta_step,
-            backup_used=backup_used,
-            is_loop=is_loop
-        )
-
-        # 4. 处理子任务完成
-        if sub_task_completed:
-            step_reward += self.params.subtask_success
-
-        # 5. 处理整个请求完成
-        if request_completed:
-            step_reward += self.params.full_accept_bonus
-
-            # 记录统计信息
-            if 'path_min_bw' in kwargs:
-                self.bw_history.append(kwargs['path_min_bw'])
-            if 'path_hops' in kwargs:
-                self.hop_history.append(kwargs['path_hops'])
-
-        # ========================================
-        # 🔥🔥🔥 关键：全局奖励归一化
-        # ========================================
-        step_reward *= self.params.reward_scale
-
-        # 6. 累加 Buffer（归一化后的值）
-        self._buffer_reward += step_reward
-
-        # 7. 如果请求完成，归档
-        if request_completed:
-            self.on_request_done(success=True)
-
-        if self.debug and abs(step_reward) > 0.001:
-            logger.debug(f"Step: {step_reward:.4f} (CPU:{cpu_remain:.1f}, BW:{bandwidth:.1f}, Hops:{hops})")
-
-        return step_reward
-
-    # ---------------------------------------------------------
-    # 生命周期管理
-    # ---------------------------------------------------------
-    def on_new_request(self, request_id: Optional[str] = None) -> None:
-        """新回合开始"""
+    def finish_request(self, final_reward: float = 0.0):
+        """请求结束，归档总奖励"""
+        total = self._buffer_reward + final_reward
+        self.reward_history.append(total)
         self._buffer_reward = 0.0
-        self._request_active = True
-        self._current_request_id = request_id or f"req_{len(self.reward_history)}"
 
-    def on_request_done(self, success: bool, final_reward_override: Optional[float] = None) -> float:
-        """回合结束，归档数据"""
-        final_reward = final_reward_override if final_reward_override is not None else self._buffer_reward
-        self.reward_history.append(final_reward)
-        self._request_active = False
-        self._current_request_id = None
-        return final_reward
-
-    # ---------------------------------------------------------
-    # 辅助与诊断
-    # ---------------------------------------------------------
-    def get_reward_diagnostics(self) -> CriticDiagnostics:
-        """获取诊断数据"""
-        count = len(self.reward_history)
-        if count == 0:
-            return CriticDiagnostics([], 0, 0, 0, 0, 0)
-
-        positive_rewards = [r for r in self.reward_history if r > 0]
-
-        return CriticDiagnostics(
-            total_rewards=self.reward_history.copy(),
-            avg_reward=float(np.mean(self.reward_history)),
-            request_count=count,
-            success_rate=len(positive_rewards) / count,
-            avg_bandwidth=float(np.mean(self.bw_history)) if self.bw_history else 0.0,
-            avg_hops=float(np.mean(self.hop_history)) if self.hop_history else 0.0
-        )
+        if len(self.reward_history) > self.history_len:
+            self.reward_history.pop(0)
 
     def save(self, path: str) -> bool:
-        """保存训练状态"""
+        """保存状态"""
         try:
             state = {
                 "params": asdict(self.params),
-                "reward_history": self.reward_history,
-                "bw_history": self.bw_history,
-                "hop_history": self.hop_history
+                "reward_history": self.reward_history
             }
             with open(path, 'w') as f:
                 json.dump(state, f, indent=2)
@@ -297,16 +314,25 @@ class RewardCritic:
             return False
 
     def load(self, path: str) -> bool:
-        """加载训练状态"""
+        """加载状态"""
         try:
             with open(path, 'r') as f:
                 state = json.load(f)
             if "params" in state:
-                self.params = RewardCriticParams(**state["params"])
+                # 兼容性处理：只加载匹配的参数
+                valid_keys = RewardCriticParams.__annotations__.keys()
+                filtered = {k: v for k, v in state["params"].items() if k in valid_keys}
+                self.params = RewardCriticParams(**filtered)
             self.reward_history = state.get("reward_history", [])
-            self.bw_history = state.get("bw_history", [])
-            self.hop_history = state.get("hop_history", [])
             return True
         except Exception as e:
             logger.error(f"Load failed: {e}")
             return False
+
+    def on_new_request(self):
+        """兼容接口"""
+        self._buffer_reward = 0.0
+
+    def criticize(self, **kwargs):
+        """兼容旧版接口 (仅返回 0，建议使用新接口)"""
+        return 0.0

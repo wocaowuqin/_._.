@@ -1,253 +1,54 @@
-#!/usr/bin/env python3
-"""Phase 1 → Phase 2 数据质量检查"""
+def verify_dc_nodes():
+    print("🔍 正在核对 Phase 3 数据转换逻辑...")
+    print("=" * 50)
 
-import pickle
-import numpy as np
-import torch
-from pathlib import Path
+    # 1. 您提供的真实定义 (1-based, 对应 MATLAB 或文档)
+    user_dc_ids = [1, 2, 3, 4, 5, 6, 7, 8, 11, 13, 14, 17, 18, 19, 20, 23]
+    print(f"📋 用户定义的 DC ID (1-based):\n   {user_dc_ids}")
+    print(f"   (共 {len(user_dc_ids)} 个节点)")
 
-print("=" * 70)
-print("🔬 Phase 1 → Phase 2 数据质量检查")
-print("=" * 70)
+    # 2. 模拟代码中的转换 (转为 0-based 索引)
+    # Python 索引 = ID - 1
+    code_dc_indices = set([x - 1 for x in user_dc_ids])
+    sorted_indices = sorted(list(code_dc_indices))
 
-data_path = Path("outputs/expert/expert_data_final.pkl")
+    print("-" * 50)
+    print(f"💻 代码内部应使用的索引 (0-based Index):\n   {sorted_indices}")
 
-if not data_path.exists():
-    print(f"❌ 数据文件不存在: {data_path}")
-    exit(1)
+    # 3. 💣 核心冲突检测 (基于您之前的日志)
+    # 之前的日志显示：Agent 部署在了 Node 8 (Index 8) 和 Node 3 (Index 3)
 
-# 加载数据
-with open(data_path, 'rb') as f:
-    data = pickle.load(f)
+    print("-" * 50)
+    print("🕵️‍♂️ 关键节点「合法性」验尸:")
 
-transitions = data.get('success', [])
+    # 检查 VNF@3 (Index 3) -> 对应 ID 4
+    check_idx_3 = 3
+    is_3_ok = check_idx_3 in code_dc_indices
+    print(f"   [Index 3] (对应 ID 4): {'✅ 合法 DC' if is_3_ok else '❌ 非法 (纯转发节点)'}")
 
-print(f"\n📊 基本信息:")
-print(f"  原始 Transitions: {len(transitions)}")
+    # 检查 VNF@5 (Index 5) -> 对应 ID 6
+    check_idx_5 = 5
+    is_5_ok = check_idx_5 in code_dc_indices
+    print(f"   [Index 5] (对应 ID 6): {'✅ 合法 DC' if is_5_ok else '❌ 非法 (纯转发节点)'}")
 
-# ============================================
-# 检查 1: 数据格式
-# ============================================
-print(f"\n✓ 检查 1: 数据格式")
+    # 🔥 检查 VNF@8 (Index 8) -> 对应 ID 9
+    check_idx_8 = 8
+    is_8_ok = check_idx_8 in code_dc_indices
+    print(f"   [Index 8] (对应 ID 9): {'✅ 合法 DC' if is_8_ok else '❌ 违规! (在非DC节点部署)'}")
 
-if len(transitions) == 0:
-    print("  ❌ 没有数据！")
-    exit(1)
+    print("=" * 50)
 
-sample = transitions[0]
-print(f"  第一个 transition 的键: {sample.keys()}")
-
-required_keys = ['state', 'action', 'reward', 'next_state', 'done']
-for key in required_keys:
-    if key in sample:
-        print(f"    ✅ {key}: 存在")
+    # 4. 最终判决
+    if not is_8_ok:
+        print("🚨 【严重警告】数据有问题！")
+        print("   原因: 您刚才的日志显示 Agent 在 [Index 8] 部署了 VNF。")
+        print("   事实: 根据您的列表，[Index 8] 对应 [ID 9]。")
+        print("   列表: 您的列表从 8 跳到了 11，中间没有 9！")
+        print("   -> 结论: 之前的代码并没有真正使用您提供的这个列表，而是使用了默认的(可能是全节点)配置。")
+        print("   -> 建议: 必须去 sfc_env.py 手动更新 self.dc_nodes！")
     else:
-        print(f"    ❌ {key}: 缺失！")
+        print("✅ 数据转换没问题，配置一致。")
 
-# ============================================
-# 检查 2: State 质量
-# ============================================
-print(f"\n✓ 检查 2: State 质量")
 
-state_sample = sample.get('state')
-
-if state_sample is None:
-    print("  ❌ State 是 None！")
-else:
-    print(f"  State 类型: {type(state_sample)}")
-
-    if hasattr(state_sample, 'x'):
-        # PyG Data 对象
-        print(f"  ✅ State 是 PyG Data 对象")
-        print(f"    节点特征 x: {state_sample.x.shape}")
-        print(f"    边索引 edge_index: {state_sample.edge_index.shape}")
-
-        # 检查节点特征是否全零
-        if hasattr(state_sample, 'x'):
-            x_mean = state_sample.x.mean().item()
-            x_std = state_sample.x.std().item()
-            x_max = state_sample.x.max().item()
-
-            print(f"\n    节点特征统计:")
-            print(f"      均值: {x_mean:.4f}")
-            print(f"      标准差: {x_std:.4f}")
-            print(f"      最大值: {x_max:.4f}")
-
-            if x_std < 0.01:
-                print(f"      ❌ 节点特征几乎全零或常数！")
-                print(f"         这会导致 GNN 无法学习")
-            elif x_std < 0.1:
-                print(f"      ⚠️  节点特征变化很小")
-            else:
-                print(f"      ✅ 节点特征正常")
-
-        # 检查是否有 req_vec
-        if hasattr(state_sample, 'req_vec'):
-            print(f"    ✅ req_vec: {state_sample.req_vec.shape}")
-
-            req_mean = state_sample.req_vec.mean().item()
-            req_std = state_sample.req_vec.std().item()
-
-            print(f"      均值: {req_mean:.4f}")
-            print(f"      标准差: {req_std:.4f}")
-
-            if req_std < 0.01:
-                print(f"      ⚠️  req_vec 几乎全零")
-        else:
-            print(f"    ⚠️  没有 req_vec")
-
-    else:
-        print(f"  ⚠️  State 不是 PyG Data 对象")
-        print(f"     这可能导致数据加载问题")
-
-# ============================================
-# 检查 3: Action 分布和映射
-# ============================================
-print(f"\n✓ 检查 3: Action 质量")
-
-# 收集所有 action
-all_actions = []
-action_formats = set()
-
-for trans in transitions[:100]:  # 检查前 100 个
-    action = trans.get('action')
-
-    action_formats.add(str(type(action)))
-
-    if isinstance(action, dict):
-        path = action.get('path', [])
-        if len(path) > 1:
-            for node in path[1:]:
-                if isinstance(node, np.integer):
-                    node = int(node)
-
-                # 转换为 0-based
-                if node >= 1 and node <= 28:
-                    node = node - 1
-
-                all_actions.append(node)
-
-    elif isinstance(action, (int, np.integer)):
-        all_actions.append(int(action))
-
-print(f"  Action 格式类型: {action_formats}")
-print(f"  提取的 Action 数: {len(all_actions)}")
-
-if all_actions:
-    print(f"  Action 范围: [{min(all_actions)}, {max(all_actions)}]")
-
-    invalid = [a for a in all_actions if a < 0 or a > 27]
-    if invalid:
-        print(f"  ❌ 发现 {len(invalid)} 个无效 Action！")
-        print(f"     示例: {invalid[:10]}")
-    else:
-        print(f"  ✅ 所有 Action 都有效")
-
-# ============================================
-# 检查 4: State-Action 配对
-# ============================================
-print(f"\n✓ 检查 4: State-Action 配对")
-
-valid_pairs = 0
-invalid_pairs = 0
-
-for i, trans in enumerate(transitions[:100]):
-    state = trans.get('state')
-    action = trans.get('action')
-
-    if state is None:
-        invalid_pairs += 1
-        continue
-
-    if not hasattr(state, 'x'):
-        invalid_pairs += 1
-        continue
-
-    # 提取 action
-    if isinstance(action, dict):
-        path = action.get('path', [])
-        if len(path) <= 1:
-            invalid_pairs += 1
-            continue
-
-    valid_pairs += 1
-
-print(f"  有效配对: {valid_pairs}/100")
-print(f"  无效配对: {invalid_pairs}/100")
-
-if invalid_pairs > 10:
-    print(f"  ❌ 过多无效配对（> 10%）")
-else:
-    print(f"  ✅ 配对质量良好")
-
-# ============================================
-# 检查 5: 同一状态的不同 action
-# ============================================
-print(f"\n✓ 检查 5: 状态多样性")
-
-# 检查是否所有状态都一样
-state_hashes = set()
-
-for trans in transitions[:100]:
-    state = trans.get('state')
-
-    if state is not None and hasattr(state, 'x'):
-        # 简单的哈希（用节点特征的和）
-        state_hash = state.x.sum().item()
-        state_hashes.add(state_hash)
-
-print(f"  不同状态数: {len(state_hashes)}/100")
-
-if len(state_hashes) < 5:
-    print(f"  ❌ 状态几乎完全相同！")
-    print(f"     这会导致模型无法区分不同情况")
-elif len(state_hashes) < 20:
-    print(f"  ⚠️  状态多样性较低")
-else:
-    print(f"  ✅ 状态多样性良好")
-
-# ============================================
-# 总结
-# ============================================
-print(f"\n" + "=" * 70)
-print(f"🎯 诊断总结")
-print(f"=" * 70)
-
-issues = []
-
-# 检查节点特征
-if hasattr(transitions[0].get('state', {}), 'x'):
-    x = transitions[0]['state'].x
-    if x.std().item() < 0.01:
-        issues.append("节点特征几乎全零")
-
-# 检查状态多样性
-if len(state_hashes) < 10:
-    issues.append(f"状态多样性过低（只有 {len(state_hashes)} 种）")
-
-# 检查配对
-if invalid_pairs > 10:
-    issues.append(f"过多无效 State-Action 配对（{invalid_pairs}%）")
-
-if issues:
-    print(f"\n❌ 发现以下问题:")
-    for i, issue in enumerate(issues, 1):
-        print(f"  {i}. {issue}")
-
-    print(f"\n💡 可能的原因:")
-    print(f"  1. Phase 1 Expert 收集的数据质量差")
-    print(f"  2. State 特征提取有问题")
-    print(f"  3. 环境的 reset/step 实现有问题")
-
-    print(f"\n🔧 建议:")
-    print(f"  1. 重新运行 Phase 1 收集更多样化的数据")
-    print(f"  2. 检查环境的 State 生成逻辑")
-    print(f"  3. 确保每个 State 都包含有用的信息")
-else:
-    print(f"\n✅ 数据质量检查通过")
-    print(f"\n如果损失仍然高，可能的原因:")
-    print(f"  1. 学习率设置不当")
-    print(f"  2. GNN 架构与数据不匹配")
-    print(f"  3. 需要更多训练 Epochs")
-
-print(f"=" * 70)
+if __name__ == "__main__":
+    verify_dc_nodes()

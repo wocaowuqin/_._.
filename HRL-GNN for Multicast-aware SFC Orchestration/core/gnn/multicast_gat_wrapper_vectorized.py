@@ -194,12 +194,14 @@ class MulticastGATWrapperVectorized(nn.Module):
         if not dest_indices:
             dest_indices = [0]
 
-        # ===== 3. GAT 编码（一次性）=====
+
+        # ===== 3. GAT 编码 =====
+        # 🔥 修复：参数名改为 req_vec
         node_embeddings, _, _ = self.gat.forward(
             x=x,
             edge_index=edge_index,
             edge_attr=edge_attr,
-            request_vec=req,
+            req_vec=req,  # 原来是 request_vec=req
             dest_indices=dest_indices,
             batch=batch
         )
