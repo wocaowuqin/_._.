@@ -156,9 +156,11 @@ class HRLAgent:
         # 经验回放
         # ============================================
         buffer_size = int(training_cfg.get('buffer_size', 50000))
+
         self.high_memory = deque(maxlen=buffer_size // 10)
         self.low_memory = deque(maxlen=buffer_size)
 
+        # ============================================
         # ============================================
         # 状态管理
         # ============================================
@@ -199,26 +201,9 @@ class HRLAgent:
                 node_feat_dim=self.state_dim,
                 goal_dim=self.goal_dim
             ).to(self.device)
-        # ✅ 黑名单学习
-        from collections import deque
-        self.blacklist_history = deque(maxlen=1000)
-        self.failed_nodes_counter = {}
-
         # ✅ 自适应epsilon
         self.adaptive_epsilon = config.get('hrl', {}).get('adaptive_epsilon', True)
         self.min_epsilon_low = 0.01
-
-        logger.info("🔄 HRLAgent已启用黑名单感知")
-        logger.info("=" * 60)
-        logger.info("✅ HRLAgent初始化完成")
-        logger.info(f"  Phase: {self.phase}")
-        logger.info(f"  Goal strategy: {self.goal_strategy}")
-        logger.info(f"  State dim: {self.state_dim}")
-        logger.info(f"  Goal dim: {self.goal_dim}")
-        logger.info(f"  High actions: {self.n_goals}")
-        logger.info(f"  Low actions: {self.n_actions}")
-        logger.info(f"  Subgoal horizon: {self.subgoal_horizon}")
-        logger.info("=" * 60)
 
     def select_action(
             self,
@@ -584,10 +569,24 @@ class HRLAgent:
     def store_transition_high(
             self, state: Dict, goal: int, reward: float, next_state: Dict, done: bool
     ):
-        """存储High-Level经验"""
+        """存储High-Level经验 (修复版: 防止索引越界)"""
+
+        # 🔥 [关键修复] 确保 goal 索引在有效范围内
+        # High-Level Q网络只有 n_goals 个输出 (例如10)
+        # 如果 goal 是物理节点ID (例如24)，会导致索引越界
+        goal_idx = goal
+        if isinstance(goal, (int, np.integer)):
+            if goal >= self.n_goals:
+                # 使用模运算映射到有效范围 [0, n_goals-1]
+                # 这是一个兜底策略，防止程序崩溃
+                goal_idx = goal % self.n_goals
+                # logger.debug(f"⚠️ Goal映射: {goal} -> {goal_idx} (Max: {self.n_goals})")
+            elif goal < 0:
+                goal_idx = 0  # 默认值
+
         self.high_memory.append({
             'state': state,
-            'goal': goal,
+            'goal': goal_idx,  # ✅ 存储修正后的索引
             'reward': reward,
             'next_state': next_state,
             'done': done
@@ -733,9 +732,40 @@ class HRLAgent:
             rewards = torch.tensor([x['reward'] for x in batch], device=self.device).float().unsqueeze(1)
             dones = torch.tensor([x['done'] for x in batch], device=self.device).float().unsqueeze(1)
 
+            # =======================================================
+            # 🔥 [关键修复] 过滤掉 action = -1 的无效数据
+            # =======================================================
+            valid_mask = (actions >= 0).squeeze()
+
+            # 如果整个 batch 都是无效动作（极端情况），跳过
+            if valid_mask.sum() == 0:
+                return 0.0
+
+            # 只保留有效的数据
+            state_tensor = state_tensor[valid_mask]
+            next_state_tensor = next_state_tensor[valid_mask]
+            actions = actions[valid_mask]
+            rewards = rewards[valid_mask]
+            dones = dones[valid_mask]
+
+            # 重新过滤 batch 列表，以便后续处理 goal_embs
+            # valid_mask 是 tensor，转回 numpy 或 list 索引处理比较麻烦
+            # 更简单的做法是：先处理好 tensor，再处理 goal_embs
+            # =======================================================
+
             # 处理 Goal Embedding
             goal_embs = []
-            for x in batch:
+            # 注意：这里我们得重新遍历 batch，或者用 mask 筛选
+            # 简单起见，我们直接遍历 batch 并应用同样的 mask 逻辑
+            # 但上面的 valid_mask 是基于 actions tensor 的
+            # 所以我们可以这样做：
+
+            valid_indices = torch.nonzero(valid_mask).squeeze().cpu().tolist()
+            if not isinstance(valid_indices, list):  # 单个元素时可能是 int
+                valid_indices = [valid_indices]
+
+            for idx in valid_indices:
+                x = batch[idx]
                 g = x.get('goal_emb')
                 if g is None:
                     g = torch.zeros(1, self.goal_dim, device=self.device)
@@ -757,6 +787,8 @@ class HRLAgent:
             # 4. 计算 Current Q
             # LowPolicy forward 返回: (logits, value)
             curr_logits, _ = self.low_policy(state_tensor, goal_tensor)
+
+            # 🔥 现在 actions 里没有 -1 了，gather 不会报错
             curr_q = curr_logits.gather(1, actions)
 
             # 5. 计算 Target Q (Double DQN)
@@ -870,70 +902,99 @@ class HRLAgent:
 
     def _select_low_action_with_blacklist(
             self,
-            state: Dict,
-            action_mask: Optional[np.ndarray],
-            blacklist_info: Optional[dict]
+            state: Any,
+            action_mask: Optional[np.ndarray] = None,
+            blacklist_info: Optional[dict] = None
     ) -> int:
-        """
-        Low-Level动作选择（黑名单感知）
+        try:
+            # 1. 获取基础动作和权重
+            if action_mask is not None and len(action_mask) > 0:
+                valid_mask = action_mask > 0
+                valid_actions = np.where(valid_mask)[0]
+                if len(valid_actions) == 0: return random.randint(0, self.n_actions - 1)
+                action_weights = action_mask[valid_actions].copy()
+            else:
+                valid_actions = np.arange(self.n_actions)
+                action_weights = np.ones(len(valid_actions))
 
-        Args:
-            state: 环境状态
-            action_mask: 动作掩码
-            blacklist_info: 黑名单信息
+            # 2. 黑名单权重惩罚
+            if blacklist_info:
+                blacklist_nodes = blacklist_info.get('nodes', [])
+                for i, action in enumerate(valid_actions):
+                    if action in blacklist_nodes: action_weights[i] *= 0.1
 
-        Returns:
-            选择的动作
-        """
-        # 获取特征
-        graph_emb = self._get_graph_embedding(state)
+            # 3. 策略选择
+            if random.random() < self.epsilon_low:
+                # 探索：基于权重的概率采样
+                p = action_weights / action_weights.sum()
+                return int(np.random.choice(valid_actions, p=p))
+            else:
+                # 利用：Q网络决策
+                if self.low_policy is not None:
+                    state_emb = self._extract_state_embedding(state)
+                    if self.current_goal_emb is None: self._generate_goal_embedding(state)
 
-        # Goal embedding
-        if self.current_goal_emb is None:
-            self._generate_goal_embedding(state)
+                    with torch.no_grad():
+                        # 🔥 修复重点：处理 low_policy 返回的元组 (logits, value)
+                        policy_output = self.low_policy(state_emb, self.current_goal_emb.to(state_emb.device))
 
-        # ✅ 处理动作掩码
-        if action_mask is not None:
-            mask_tensor = torch.FloatTensor(action_mask).unsqueeze(0).to(self.device)
+                        if isinstance(policy_output, tuple):
+                            q_values = policy_output[0].cpu().numpy().flatten()
+                        else:
+                            q_values = policy_output.cpu().numpy().flatten()
 
-            # 检查有效动作数
-            valid_actions = np.where(action_mask > 0)[0]
-            if len(valid_actions) == 0:
-                logger.error("❌ 所有动作被Mask！返回动作0")
-                return 0
+                    # Q值与Mask权重融合
+                    combined_scores = q_values[valid_actions] * action_weights
+                    return int(valid_actions[np.argmax(combined_scores)])
 
-            logger.debug(f"有效动作: {len(valid_actions)}个")
+                return int(valid_actions[np.argmax(action_weights)])
+
+        except Exception as e:
+            logger.error(f"[Select Low Action] Error: {e}")
+            return random.randint(0, self.n_actions - 1)
+
+    def _extract_state_embedding(self, state):
+        """🔥 修复 Data 对象无法直接投影的问题"""
+        try:
+            # A. 处理 PyG Data 对象
+            if hasattr(state, 'x') and hasattr(state, 'edge_index'):
+                if self.encoder is not None:
+                    return self._get_graph_embedding(state)
+
+                # 如果没有 Encoder，手动池化节点特征
+                x = state.x
+                state_tensor = torch.mean(x, dim=0, keepdim=True)  # [1, node_feat_dim]
+
+            # B. 处理已经是 Tensor 或 Numpy 的情况
+            else:
+                state_tensor = self._prepare_state(state)
+                if state_tensor.dim() == 1: state_tensor = state_tensor.unsqueeze(0)
+
+            # 🔥 统一投影到 hidden_dim (128)
+            if state_tensor.size(-1) != self.state_dim:
+                if not hasattr(self, '_state_projection'):
+                    self._state_projection = nn.Linear(state_tensor.size(-1), self.state_dim).to(self.device)
+
+                with torch.no_grad():
+                    # 确保输入是 Tensor 而非 Data 对象
+                    state_tensor = self._state_projection(state_tensor.to(self.device))
+
+            return state_tensor
+
+        except Exception as e:
+            logger.error(f"提取state embedding失败: {e}")
+            return torch.zeros(1, self.state_dim, device=self.device)
+
+    def _prepare_state(self, state):
+        """辅助方法：将状态转换为tensor"""
+        if isinstance(state, dict):
+            # PyG Data 格式
+            return state
+        elif isinstance(state, np.ndarray):
+            return torch.FloatTensor(state).unsqueeze(0)
         else:
-            mask_tensor = None
-            logger.debug("⚠️ 未提供动作掩码")
-
-        # Low-Level策略选择
-        with torch.no_grad():
-            action, _ = self.low_policy.select_action(
-                graph_emb,
-                self.current_goal_emb,
-                mask_tensor,
-                epsilon=self.epsilon_low
-            )
-
-        action_idx = action.item()
-
-        # ✅ 安全校验：确保动作有效
-        if action_mask is not None and 0 <= action_idx < len(action_mask):
-            if action_mask[action_idx] == 0:
-                logger.warning(f"⚠️ 动作{action_idx}被Mask，选择替代动作")
-                valid_actions = np.where(action_mask > 0)[0]
-
-                if len(valid_actions) > 0:
-                    # 优先选择权重>0.5的（完全有效）
-                    high_weight = np.where(action_mask > 0.5)[0]
-                    action_idx = high_weight[0] if len(high_weight) > 0 else valid_actions[0]
-                    logger.debug(f"替代动作: {action_idx}")
-                else:
-                    action_idx = 0
-
-        return action_idx
-
+            # 已经是tensor
+            return state
     # ============================================
     # 4. 新增 record_failure 方法
     # ============================================

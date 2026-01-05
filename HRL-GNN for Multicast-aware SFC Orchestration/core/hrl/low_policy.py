@@ -43,7 +43,7 @@ class GoalConditionedLowLevelPolicy(nn.Module):
 
         # 从环境配置读取动作数量
         env_cfg = config.get('environment', {})
-        self.action_dim = env_cfg.get('nb_low_level_actions', 50)
+        self.action_dim = env_cfg.get('nb_low_level_actions', 28)
 
         dropout = config.get('dropout', 0.1)
 

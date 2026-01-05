@@ -17,7 +17,7 @@ import torch
 import random
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from utils.config_utils import load_config
-from envs.sfc_env import SFC_HIRL_Env
+from envs.sfc_env3 import SFC_HIRL_Env
 from core.hrl.agent import HRL_DQN_Agent  # ✅ 使用统一的 Agent
 from trainer.phase1_collector import Phase1ExpertCollector
 from trainer.phase2_il_trainer import Phase2ILTrainer

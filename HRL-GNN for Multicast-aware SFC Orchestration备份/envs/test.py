@@ -2,7 +2,7 @@ import numpy as np
 import logging
 from pathlib import Path
 from utils.config_utils import load_config
-from envs.sfc_env import SFC_HIRL_Env
+from envs.sfc_env3 import SFC_HIRL_Env
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)

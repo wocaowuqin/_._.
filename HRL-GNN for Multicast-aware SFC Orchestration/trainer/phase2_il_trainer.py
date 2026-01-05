@@ -23,7 +23,7 @@ import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
 from tqdm import tqdm
 import platform
-
+from torch_geometric.loader import DataLoader as PyGDataLoader
 logger = logging.getLogger(__name__)
 
 
@@ -104,6 +104,8 @@ class ExpertDataset(Dataset):
         将一条完整路径拆解为多个训练样本：
         1. High-Level Label: 这条路的终点是第几个目的地？
         2. Low-Level Label: 当前节点的下一跳是谁？
+
+        🔥 优化：只保留终点在dest中的路径，过滤Hub路径
         """
         path = trans['action']['path']
         req = trans.get('request', {})  # Phase 1 必须保存 request 信息
@@ -113,22 +115,26 @@ class ExpertDataset(Dataset):
 
         steps = []
 
-        # 🔥 [HRL Labeling]
-        # 1. 确定 Subgoal (路径终点)
+        # 🔥 [优化] 确定 Subgoal 并过滤
         subgoal_node = int(path[-1])
         if subgoal_node >= 28: subgoal_node %= 28
 
-        # 2. 确定 High Action Index (Subgoal 是 dest 列表里的第几个？)
-        # 如果找不到（比如是回程或者特殊情况），设为 0 (Default)
+        # 获取目的地列表
         dest_list = req.get('dest', [])
+
+        # 🔥 [关键优化] 只保留终点在dest中的路径
+        if subgoal_node not in dest_list:
+            # 这是到Hub的中间路径，跳过
+            return []
+
+        # 确定 High Action Index
         try:
-            # 找到 subgoal 在 dest 中的索引
             high_action_idx = dest_list.index(subgoal_node)
-            # 限制在 max_goals 范围内 (假设是 10)
             if high_action_idx >= 10:
                 high_action_idx = 0
         except ValueError:
-            high_action_idx = 0  # Fallback
+            # 理论上不应该到这里，因为已经检查过了
+            return []
 
         # 3. 生成每一步的样本
         for step_idx in range(len(path) - 1):
@@ -151,8 +157,22 @@ class ExpertDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def __getitem__(self, idx):
-        return self.samples[idx]
+    # 修改 phase2_il_trainer.py 中的 ExpertDataset.__getitem__
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        state = sample['state']
+
+        # 🔥 [核心修复] 如果旧的专家数据里没存 mask，实时补一个全 1 的掩码防止崩溃
+        # 或者如果你能访问 env，可以调用 env.get_low_level_action_mask()
+        if not hasattr(state, 'action_mask'):
+            # 这里的 28 是你的动作空间维度（根据日志提示）
+            state.action_mask = torch.ones((1, 28), dtype=torch.float32)
+
+        return {
+            'state': state,
+            'high_label': torch.tensor(sample['high_label'], dtype=torch.long),
+            'low_label': torch.tensor(sample['low_label'], dtype=torch.long)
+        }
 
 
 class Phase2ILTrainer:
@@ -162,7 +182,9 @@ class Phase2ILTrainer:
         self.cfg = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-
+        self._loss_high_sum = 0.0
+        self._loss_low_sum = 0.0
+        self._loss_count = 0
         # 训练参数
         phase2_cfg = config.get('phase2', {})
         self.epochs = phase2_cfg.get('epochs', 200)
@@ -179,10 +201,19 @@ class Phase2ILTrainer:
             self.model_low = agent.low_policy
             self.optimizer_high = agent.optimizer_high
             self.optimizer_low = agent.optimizer_low
+
+            # 🔥 [优化] 添加学习率调度器（移除verbose参数以兼容旧版PyTorch）
+            self.scheduler_high = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer_high, mode='min', factor=0.5, patience=10, min_lr=1e-6
+            )
+            self.scheduler_low = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer_low, mode='min', factor=0.5, patience=10, min_lr=1e-6
+            )
         else:
             logger.warning("⚠️ Phase 2: 检测到旧版 Agent，仅训练 PolicyNet")
             self.model = agent.policy_net
             self.optimizer = agent.optimizer
+            self.scheduler = None
 
         self.criterion = nn.CrossEntropyLoss()
 
@@ -240,27 +271,20 @@ class Phase2ILTrainer:
         return graph_batch, high_labels, low_labels
 
     def run(self):
+        """主运行循环"""
         if not self.train_loader:
-            logger.error("❌ 数据未就绪，跳过训练")
+            logger.error("❌ 数据未就绪，停止训练")
             return
 
         logger.info("🚀 开始 Phase 2 模仿学习 (HRL Mode)...")
-
-        if self.is_hrl:
-            self.model_high.train()
-            self.model_low.train()
-        else:
-            self.model.train()
-
         for epoch in range(1, self.epochs + 1):
             train_loss = self._train_epoch(epoch)
-            val_loss = self._validate_epoch(epoch)
 
-            logger.info(f"Epoch {epoch} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-
-            if self.early_stopping(val_loss):
-                logger.info("🛑 早停触发")
-                break
+            # 日志统计
+            if self._loss_count > 0 and epoch % 10 == 0:
+                avg_h = self._loss_high_sum / self._loss_count
+                avg_l = self._loss_low_sum / self._loss_count
+                logger.info(f"📊 Epoch {epoch} 分离Loss: High={avg_h:.4f}, Low={avg_l:.4f}")
 
             if epoch % 10 == 0:
                 self._save_checkpoint(epoch)
@@ -269,69 +293,91 @@ class Phase2ILTrainer:
         logger.info("✅ Phase 2 完成")
 
     def _train_epoch(self, epoch):
+        """
+        🔥 [IL V3.1 终极自愈版]
+        1. 修复 Encoder 属性缺失：改用 Agent 封装的 _get_graph_embedding 接口
+        2. 修复掩码缺失：加入 hasattr 检查
+        3. 强化 Loss：保留 15.0 倍非法动作惩罚
+        """
+        self.model_high.train()
+        self.model_low.train()
+
+        # 初始化统计变量 (解决 _loss_count 报错)
+        self._loss_high_sum = 0.0
+        self._loss_low_sum = 0.0
+        self._loss_count = 0
         total_loss = 0
-        count = 0
 
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}", leave=False)
-        for batch in pbar:
-            if not batch: continue
-
-            # Unpack batch
-            states, high_labels, low_labels = batch
-            states = states.to(self.device)
-            high_labels = high_labels.to(self.device)
-            low_labels = low_labels.to(self.device)
-
-            loss = 0
-
-            if self.is_hrl:
-                # -------------------------------------------------
-                # 🔥 HRL 训练逻辑
-                # -------------------------------------------------
-
-                # 1. High-Level Forward
-                # 获取 Graph Embedding (Assuming agent has helper or use encoder directly)
-                if self.agent.encoder:
-                    # 使用 Agent 里的 Encoder
-                    graph_emb = self.agent.encoder(states.x, states.edge_index, states.batch)
-                    # 如果 Encoder 输出维度不对，可能需要 Projection
-                    # 这里假设 Agent 内部已经处理好了，或者 high_policy 内部有 projection
-                else:
-                    # Fallback (应该尽量避免)
-                    graph_emb = self.agent._get_graph_embedding(states)
-
-                # 预测 Goal Index
-                high_logits, subgoal_emb, _ = self.model_high(graph_emb, return_subgoal=True)
-
-                # 2. Low-Level Forward
-                # Low Policy 使用 (Graph Emb + Subgoal Emb) 预测 Next Hop
-                # 注意：这里我们使用 Predicted Subgoal Emb，属于 End-to-End 训练
-                low_logits, _ = self.model_low(graph_emb, subgoal_emb)
-
-                # 3. Compute Combined Loss
-                loss_high = self.criterion(high_logits, high_labels)
-                loss_low = self.criterion(low_logits, low_labels)
-
-                # 联合 Loss，可以加权
-                loss = loss_high * 0.5 + loss_low
-
-                self.optimizer_high.zero_grad()
-                self.optimizer_low.zero_grad()
-                loss.backward()
-                self.optimizer_high.step()
-                self.optimizer_low.step()
-
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}")
+        for batch_data in pbar:
+            # 1. 自动适配 dict/tuple 数据解包
+            if isinstance(batch_data, dict):
+                states = batch_data['state'].to(self.device)
+                high_labels = batch_data['high_label'].to(self.device)
+                low_labels = batch_data['low_label'].to(self.device)
             else:
-                # 旧版逻辑
-                pass  # ... (Legacy code omitted for brevity)
+                states, high_labels, low_labels = batch_data
+                states = states.to(self.device)
+                high_labels = high_labels.to(self.device)
+                low_labels = low_labels.to(self.device)
 
+            self.optimizer_high.zero_grad()
+            self.optimizer_low.zero_grad()
+
+            # 2. 🔥【核心修复】调用 Agent 内部稳定的嵌入接口
+            # agent._get_graph_embedding 内部处理了对 self.encoder 的调用和 None 检查
+            graph_emb = self.agent._get_graph_embedding(states)
+
+            # 3. 前向预测
+            high_logits, subgoal_emb, _ = self.model_high(graph_emb, return_subgoal=True)
+            low_logits, _ = self.model_low(graph_emb, subgoal_emb)
+
+            # 4. 动作掩码处理 (支持旧数据兼容)
+            if hasattr(states, 'action_mask'):
+                action_masks = states.action_mask.float()
+            else:
+                # 如果 states 里没有掩码，使用全 1 掩码（不惩罚但保证逻辑运行）
+                action_masks = torch.ones((states.num_graphs, low_logits.size(-1)), device=self.device)
+
+            # 5. 损失计算
+            loss_high = self.criterion(high_logits, high_labels)
+            loss_low_bc = self.criterion(low_logits, low_labels)
+
+            # 非法动作抑制：惩罚模型在 Masked 为 0 的节点上分配的概率
+            low_probs = torch.softmax(low_logits, dim=-1)
+            illegal_penalty = (low_probs * (1.0 - action_masks)).sum(dim=-1).mean()
+
+            # 综合损失 (保留 15.0x 非法惩罚权重)
+            loss = loss_high * 0.5 + loss_low_bc + 15.0 * illegal_penalty
+
+            # 6. 反向传播与优化
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model_high.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.model_low.parameters(), 1.0)
+            self.optimizer_high.step()
+            self.optimizer_low.step()
+
+            # 记录统计
+            self._loss_high_sum += loss_high.item()
+            self._loss_low_sum += loss_low_bc.item()
+            self._loss_count += 1
             total_loss += loss.item()
-            count += 1
-            pbar.set_postfix({'loss': loss.item()})
 
-        return total_loss / max(1, count)
+            pbar.set_postfix({'L': f"{loss.item():.3f}", 'P': f"{illegal_penalty.item():.3f}"})
 
+        return total_loss / max(1, self._loss_count)
     def _validate_epoch(self, epoch):
+        # 🔥 [调试] 打印分离的Loss
+        if hasattr(self, '_loss_count') and self._loss_count > 0:
+            avg_high = self._loss_high_sum / self._loss_count
+            avg_low = self._loss_low_sum / self._loss_count
+            if epoch % 10 == 0:  # 每10个epoch打印
+                logger.info(f"   📊 分离Loss: High={avg_high:.4f}, Low={avg_low:.4f}")
+            # 重置
+            self._loss_high_sum = 0
+            self._loss_low_sum = 0
+            self._loss_count = 0
+
         total_loss = 0
         count = 0
 

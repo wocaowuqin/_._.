@@ -446,6 +446,224 @@ def diagnose_goal_embedding(agent, env):
         return False
 
 
+# =========================================================================
+# 🔥 把这个函数粘贴到 diagnose_goal_embedding 之后，main() 之前
+# =========================================================================
+def diagnose_mask_system(env, agent):
+    """
+    🔍 全面诊断 Mask 系统 (环境 + Agent)
+    """
+    import traceback  # 局部导入，防止报错
+    import numpy as np  # 确保numpy可用
+
+    print("\n" + "=" * 60)
+    print("🏥 [诊断开始] Mask 系统健康检查")
+    print("=" * 60)
+
+    try:
+        # 1. 静态检查
+        print("\n1️⃣ [静态检查] 环境属性:")
+        print(f"   👉 _n_actions: {getattr(env, '_n_actions', '❌ 缺失')}")
+        print(f"   👉 n (节点数): {getattr(env, 'n', '❌ 缺失')}")
+        print(f"   👉 get_action_mask: {'✅' if hasattr(env, 'get_action_mask') else '❌'}")
+        print(f"   👉 get_low_level_action_mask: {'✅' if hasattr(env, 'get_low_level_action_mask') else '❌'}")
+
+        # 2. 动态检查 Reset
+        print("\n2️⃣ [动态检查] Reset:")
+        obs, info = env.reset()
+        print(f"   ✅ Reset 成功 | Info keys: {list(info.keys())}")
+
+        mask = info.get('action_mask')
+        if mask is not None:
+            print(f"   ✅ Mask 获取成功 | Shape: {mask.shape} | Sum: {mask.sum()}")
+        else:
+            print("   ❌ 错误: info['action_mask'] 为 None")
+
+        # 3. 动态检查 Step
+        print("\n3️⃣ [动态检查] Step:")
+        try:
+            _, _, _, _, step_info = env.step(0)
+            step_mask = step_info.get('action_mask')
+            if step_mask is not None:
+                print(f"   ✅ Step Mask 获取成功 | Sum: {step_mask.sum()}")
+            else:
+                print("   ❌ 错误: step_info['action_mask'] 为 None")
+        except Exception as e:
+            print(f"   ❌ Step 崩溃: {e}")
+
+        # 4. Agent 兼容性
+        print("\n4️⃣ [兼容检查] Agent.select_action:")
+        try:
+            # 重新 Reset
+            obs, info = env.reset()
+            curr_mask = info.get('action_mask')
+            if curr_mask is None and hasattr(env, 'n'):
+                curr_mask = np.ones(env.n)  # 临时 Mask
+
+            # 获取 unconnected_dests，兼容不同属性名
+            unconnected = []
+            if hasattr(env, 'current_tree'):
+                unconnected = list(env.current_tree.get('connected_dests', []))
+
+            high, low, _ = agent.select_action(
+                state=obs,
+                action_mask=curr_mask,
+                unconnected_dests=unconnected,
+                blacklist_info={}
+            )
+            print(f"   ✅ Agent 调用成功: Low Action = {low}")
+        except Exception as e:
+            print(f"   ❌ Agent 崩溃: {e}")
+            traceback.print_exc()
+
+    except Exception as e:
+        print(f"❌ 诊断脚本自身出错: {e}")
+        traceback.print_exc()
+
+    print("=" * 60 + "\n")
+
+
+def diagnose_agent_timing_performance(env, agent):
+    """
+    🔍 深度诊断函数：检测 Agent 动作密度与物理时间的失配度
+    """
+    print("\n" + "=" * 70)
+    print("⏳ Agent 编排耗时与请求生命周期对齐检查")
+    print("=" * 70)
+
+    # 1. 环境重置
+    obs, info = env.reset()
+    req = env.current_request
+
+    # 获取数据集的核心时间参数
+    # arrive_time_step = math.ceil(arrive_time)
+    # leave_time_step = math.ceil(leave_time)
+    t_start = float(req.get('arrive_time_step', 0))
+    t_limit = float(req.get('leave_time_step', 0))
+    logical_ttl = t_limit - t_start
+    physical_duration = req.get('lifetime', 0)
+
+    print(f"📋 请求 ID: {req.get('id')} | 源: {req.get('source')} | 目的数: {len(req.get('dest', []))}")
+    print(f"   🔹 数据集物理寿命: {physical_duration:.3f} s")
+    print(f"   🔹 仿真允许窗口: {t_start} -> {t_limit} (剩余 {logical_ttl} 个时间单位)")
+    print("-" * 50)
+
+    done = False
+    total_agent_steps = 0
+    start_sim_time = env.time_step
+
+    # 记录资源释放标志
+    resource_released_at = None
+
+    while not done and total_agent_steps < 300:
+        total_agent_steps += 1
+
+        # 选择动作并执行
+        # 使用你代码中的 low level action 逻辑
+        mask = env.get_low_level_action_mask()
+        # 模拟 agent 决策
+        high, low, _ = agent.select_action(obs, action_mask=mask)
+
+        obs, reward, done, truncated, info = env.step(low)
+
+        # 监测 time_step 的推进：你代码中设为 += 0.0001
+        current_time = env.time_step
+
+        # 实时检测资源过期
+        if current_time >= t_limit and resource_released_at is None:
+            resource_released_at = total_agent_steps
+            print(f"⚠️ [警告] Agent 第 {total_agent_steps} 步：系统时间达到 {current_time:.4f}。")
+            print(f"      此后 Agent 构建的多播树边将因 leave_time_step 过期而可能被实时回收。")
+
+    sim_time_consumed = env.time_step - start_sim_time
+
+    print("-" * 50)
+    print(f"🏁 诊断结论:")
+    print(f"1. Agent 总决策步数: {total_agent_steps} 步")
+    print(f"2. 消耗仿真逻辑时间: {sim_time_consumed:.4f} 单位")
+    print(
+        f"3. 时间推进密度: 1 步决策 = {sim_time_consumed / total_agent_steps if total_agent_steps > 0 else 0:.6f} 仿真单位")
+
+    # 核心病理分析
+    if sim_time_consumed > logical_ttl:
+        print(f"\n❌ 病状: 决策太慢。Agent 消耗了 {sim_time_consumed:.2f} 单位，超出了窗口 {logical_ttl:.2f}。")
+    elif resource_released_at and not done:
+        print(f"\n❌ 病状: 半路夭折。请求在第 {resource_released_at} 步动作时已在逻辑上过期。")
+    else:
+        print(f"\n✅ 状态: 正常。Agent 在资源释放截止点前完成了任务。")
+
+    print("=" * 70 + "\n")
+
+def diagnose_detailed_timing(env, agent):
+    """
+    🔍 深度诊断：Agent 动作步数 vs. 逻辑时间 vs. 物理时间
+    """
+    import time
+    import torch
+
+    print("\n" + "=" * 60)
+    print("🕵️‍♂️ Agent 运行耗时与逻辑生命周期深度诊断")
+    print("=" * 60)
+
+    state, info = env.reset()
+    req = env.current_request
+
+    # 获取数据集定义的参数
+    arrive_step = getattr(req, 'arrive_time_step', 1)
+    leave_step = getattr(req, 'leave_time_step', 3)
+    logical_ttl = leave_step - arrive_step
+    physical_ttl = getattr(req, 'lifetime', 0)  # 数据集里的 2.21s
+
+    print(f"📋 请求 ID: {getattr(req, 'id', '?')}")
+    print(f"   ⏳ 数据集意图: 物理寿命 {physical_ttl:.3f}s | 逻辑窗口 {logical_ttl} 步")
+    print(f"   🕒 释放截止点: 仿真第 {leave_step} 步")
+    print("-" * 40)
+
+    done = False
+    total_steps = 0
+    start_real_time = time.time()
+
+    # 模拟一个完整的 Episode
+    while not done and total_steps < 300:
+        total_steps += 1
+
+        # --- 测量决策耗时 ---
+        t_dec_start = time.time()
+        # 兼容不同 agent 的调用方式
+        high, low, act_info = agent.select_action(
+            state,
+            action_mask=env.get_low_level_action_mask(),
+            unconnected_dests=list(env.current_tree.get('connected_dests', []))
+        )
+        t_dec = time.time() - t_dec_start
+
+        # --- 测量执行耗时 ---
+        t_exe_start = time.time()
+        state, reward, done, _, info = env.step(low)
+        t_exe = time.time() - t_exe_start
+
+        # 实时监控逻辑时间点
+        if env.time_step == leave_step:
+            print(f"⚠️  [警告] 回合第 {total_steps} 步: 仿真时钟达到 {env.time_step}，资源已被环境强制回收！")
+            print(f"      (此时 Agent 还没连完树，正在做无用功...)")
+
+    total_real_time = time.time() - start_real_time
+
+    print("-" * 40)
+    print(f"🏁 诊断总结:")
+    print(f"1. 现实总计算耗时: {total_real_time:.4f} 秒")
+    print(f"2. Agent 决策动作总数: {total_steps} 步")
+    print(f"3. 仿真逻辑时间进度: 1 步动作 = 1.0 仿真时间单位")
+
+    # 核心结论
+    if total_steps > logical_ttl:
+        ratio = total_steps / logical_ttl
+        print(f"\n❌ 诊断结论: Agent 严重超时！")
+        print(f"   Agent 用了 {total_steps} 步才跑完，是请求寿命({logical_ttl}步)的 {ratio:.1f} 倍。")
+        print(f"   这意味着请求在仿真开始几秒内就过期了，Agent 剩下的 90% 动作都在处理无效请求。")
+    else:
+        print(f"\n✅ 诊断结论: Agent 效率极高，在请求过期前完成了任务。")
+    print("=" * 60 + "\n")
 def main():
     parser = argparse.ArgumentParser(description="HRL-GNN SFC Orchestration Training Pipeline")
     parser.add_argument('--phase', type=str, required=True,
@@ -517,6 +735,37 @@ def main():
         inject_dynamic_dimensions(config, env)
 
         logger.info("✅ Environment Initialized Successfully")
+
+        # 🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
+        # [插入] 偷看一眼资源配置
+        # 🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
+        try:
+            print("\n" + "=" * 40)
+            if hasattr(env.resource_mgr, 'nodes'):
+                nodes = env.resource_mgr.nodes
+                # 兼容字典结构 {'cpu': [...], ...}
+                if isinstance(nodes, dict):
+                    cpu_data = nodes.get('cpu', [])
+                    print(f"👀 CPU配置 (前5个): {cpu_data[:5] if len(cpu_data) > 0 else '空'}")
+                    # 🔥🔥🔥【新增】打印内存 🔥🔥🔥
+                    mem_data = nodes.get('memory', [])
+                    print(f"👀 MEM配置 (前5个): {mem_data[:5] if len(mem_data) > 0 else '空'}")
+                # 兼容矩阵结构 [N, Features]
+                elif hasattr(nodes, 'shape'):
+                    print(f"👀 CPU配置 (前5个): {nodes[:5, 0]}")
+                # 兼容列表结构
+                else:
+                    print(f"👀 CPU配置 (原始): {nodes}")
+            else:
+                print("👀 resource_mgr.nodes 属性不存在")
+
+            # 顺便看一下带宽
+            bw_cap = config.get('capacities', {}).get('bandwidth', '未知')
+            print(f"👀 默认带宽配置: {bw_cap}")
+            print("=" * 40 + "\n")
+        except Exception as e:
+            print(f"⚠️ 资源打印失败: {e}")
+        # 🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥
     except Exception as e:
         logger.error(f"❌ 环境初始化崩溃: {e}")
         import traceback
@@ -713,6 +962,8 @@ def main():
             logger.warning(f"⚠️ 未找到预训练模型: {pretrained_path}")
 
         # 3. 诊断与训练
+
+        diagnose_mask_system(env, agent)
         if not diagnose_goal_embedding(agent, env):
             return
 

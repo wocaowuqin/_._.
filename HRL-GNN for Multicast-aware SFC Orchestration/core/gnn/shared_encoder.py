@@ -1,6 +1,10 @@
 """
 core/gnn/shared_encoder.py
-GNN 共享编码器 - 终极修复版 (带自动维度适配和详细日志)
+GNN 共享编码器 - V2.0 动态特征强化版
+核心改进：
+1. 显式分离静态拓扑特征和动态状态特征
+2. 动态特征独立处理链路（MLP + 非线性）
+3. 强力融合确保动态信号能主导决策
 """
 
 import torch
@@ -26,6 +30,9 @@ class SharedEncoder(nn.Module):
         hidden_dim = 128
         self.num_layers = kwargs.get('num_layers', 2)
 
+        # 🔥 新增：动态特征维度（默认最后3维）
+        self.num_dynamic_features = kwargs.get('num_dynamic_features', 3)
+
         # 情况 A: 传入了一个 config 对象或字典
         if len(args) == 1 and (isinstance(args[0], dict) or hasattr(args[0], 'get') or hasattr(args[0], 'gnn')):
             cfg = args[0]
@@ -42,6 +49,7 @@ class SharedEncoder(nn.Module):
             edge_feat_dim = get_cfg('edge_feat_dim', edge_feat_dim)
             request_dim = get_cfg('request_feat_dim', request_dim)
             hidden_dim = get_cfg('hidden_dim', hidden_dim)
+            self.num_dynamic_features = get_cfg('num_dynamic_features', self.num_dynamic_features)
 
         # 情况 B: 位置参数
         elif len(args) >= 3:
@@ -62,22 +70,28 @@ class SharedEncoder(nn.Module):
         self.request_dim = int(request_dim)
         self.hidden_dim = int(hidden_dim)
 
-        logger.info(f"🔍 [SharedEncoder] Init: Node={self.node_feat_dim}, Edge={self.edge_feat_dim}, Req={self.request_dim}, Hidden={self.hidden_dim}")
+        # 🔥 计算静态特征维度
+        self.static_feat_dim = self.node_feat_dim - self.num_dynamic_features
+
+        logger.info(f"🔍 [SharedEncoder V2.0] Init:")
+        logger.info(f"   Total Node Feat: {self.node_feat_dim}")
+        logger.info(f"   Static Feat: {self.static_feat_dim}")
+        logger.info(f"   Dynamic Feat: {self.num_dynamic_features}")
+        logger.info(f"   Edge: {self.edge_feat_dim}, Req: {self.request_dim}, Hidden: {self.hidden_dim}")
 
         # ====================================================
-        # 2. 网络构建
+        # 2. 网络构建 - 双流架构
         # ====================================================
 
-        # 第一层 GAT
+        # 🔵 静态流：拓扑结构感知（GAT）
         self.conv1 = GATv2Conv(
-            in_channels=self.node_feat_dim,
+            in_channels=self.static_feat_dim,
             out_channels=self.hidden_dim,
             heads=4,
             edge_dim=self.edge_feat_dim if self.edge_feat_dim > 0 else None,
             concat=False
         )
 
-        # 第二层 GAT
         self.conv2 = GATv2Conv(
             in_channels=self.hidden_dim,
             out_channels=self.hidden_dim,
@@ -86,18 +100,27 @@ class SharedEncoder(nn.Module):
             concat=False
         )
 
-        # 请求特征层
+        # 🟢 动态流：状态感知（MLP + 强非线性）
+        # 专门处理 [tree_mask, fork_mask, progress_ratio] 等动态特征
+        self.state_fc1 = nn.Linear(self.num_dynamic_features, self.hidden_dim // 2)
+        self.state_fc2 = nn.Linear(self.hidden_dim // 2, self.hidden_dim)
+
+        # 🔥 动态特征门控机制（让动态特征能"一票否决"静态偏好）
+        self.gate_fc = nn.Linear(self.num_dynamic_features, self.hidden_dim)
+
+        # 🟡 请求特征层
         if self.request_dim > 0:
             self.req_fc = nn.Linear(self.request_dim, self.hidden_dim)
         else:
             self.req_fc = None
 
-        # 融合层
+        # 🔵 融合层（三路融合：静态 + 动态 + 请求）
         self.fusion = nn.Linear(self.hidden_dim * 2, self.hidden_dim)
         self.output_dim = self.hidden_dim
 
         # 状态标记
         self._warned = set()
+        self._step_count = 0
 
     def _fix_dim(self, tensor, expected_dim, name="tensor"):
         """自动修复维度不匹配"""
@@ -125,11 +148,21 @@ class SharedEncoder(nn.Module):
 
     def forward(self, x, edge_index, edge_attr=None, req_vec=None, batch=None):
         device = x.device
+        self._step_count += 1
 
         # 1. 自动修复节点特征
         x = self._fix_dim(x, self.node_feat_dim, "node_feat")
 
-        # 2. 自动修复边缘特征
+        # 🔥🔥🔥 2. 显式分离静态和动态特征
+        static_x = x[:, :-self.num_dynamic_features]  # 前N-3维：静态拓扑特征
+        dynamic_x = x[:, -self.num_dynamic_features:]  # 后3维：[tree_mask, connected_mask, progress_ratio]
+
+        # 3. 提取进度信号（假设动态特征第3维是进度）
+        # progress_ratio 范围 [0.0, 1.0]
+        progress_ratio = dynamic_x[:, -1:]
+        is_completed = (progress_ratio >= 0.99).float()  # 判定任务是否已部署完成
+
+        # 4. 自动修复边缘特征
         if self.edge_feat_dim > 0:
             if edge_attr is None:
                 num_edges = edge_index.shape[1]
@@ -137,18 +170,36 @@ class SharedEncoder(nn.Module):
             else:
                 edge_attr = self._fix_dim(edge_attr, self.edge_feat_dim, "edge_attr")
 
-        # 3. GAT 卷积
+        # 🔵 5. 静态流：GAT卷积捕捉拓扑结构
         try:
-            x = self.conv1(x, edge_index, edge_attr=edge_attr)
-            x = torch.relu(x)
-            x = self.conv2(x, edge_index, edge_attr=edge_attr)
+            static_emb = self.conv1(static_x, edge_index, edge_attr=edge_attr)
+            static_emb = F.relu(static_emb)
+            static_emb = self.conv2(static_emb, edge_index, edge_attr=edge_attr)
+            static_emb = F.relu(static_emb)
         except RuntimeError as e:
             logger.error(f"❌ [SharedEncoder] GAT Forward Failed: {e}")
-            logger.error(f"   x shape: {x.shape}")
-            logger.error(f"   edge_attr shape: {edge_attr.shape if edge_attr is not None else 'None'}")
             raise e
 
-        # 4. 请求特征处理
+        # 🟢 6. 动态流：MLP处理状态特征
+        state_emb = F.relu(self.state_fc1(dynamic_x))
+        state_emb = F.relu(self.state_fc2(state_emb))
+
+        # 🔥 7. 增强版门控机制：引入完成态强力抑制
+        # 原有的注意力权重
+        gate_weights = torch.sigmoid(self.gate_fc(dynamic_x))
+
+        # 🔥 [新增逻辑] 如果进度已满，大幅降低静态特征(拓扑惯性)的影响力
+        # 这会减弱 Agent 留在旧有树节点(静态特征强)的倾向，迫使它关注目的地
+        completion_inhibition = 1.0 - (is_completed * 0.8)  # 进度满时削弱 80% 拓扑特征
+        gate_weights = gate_weights * completion_inhibition
+
+        # 🔥 融合：动态特征通过增强门控调制静态特征
+        modulated_static = static_emb * gate_weights
+
+        # 进度满时，让 state_emb（包含进度信息）占据主导地位
+        node_emb = modulated_static + (state_emb * (1.0 + is_completed * 2.0))
+
+        # 8. 请求特征处理 (保持原有逻辑)
         if self.req_fc is not None:
             if req_vec is None:
                 batch_size = 1 if batch is None else (batch.max().item() + 1)
@@ -158,24 +209,24 @@ class SharedEncoder(nn.Module):
                 req_vec = self._fix_dim(req_vec, self.request_dim, "req_vec")
                 req_emb = self.req_fc(req_vec)
         else:
-             batch_size = 1 if batch is None else (batch.max().item() + 1)
-             req_emb = torch.zeros(batch_size, self.hidden_dim, device=device)
+            batch_size = 1 if batch is None else (batch.max().item() + 1)
+            req_emb = torch.zeros(batch_size, self.hidden_dim, device=device)
 
-        # 5. 智能扩展
+        # 9. 智能扩展
         if batch is None:
-            batch = torch.zeros(x.size(0), dtype=torch.long, device=device)
+            batch = torch.zeros(node_emb.size(0), dtype=torch.long, device=device)
 
         if req_emb.dim() == 1:
-            req_expanded = req_emb.unsqueeze(0).expand(x.size(0), -1)
+            req_expanded = req_emb.unsqueeze(0).expand(node_emb.size(0), -1)
         else:
             max_batch_idx = batch.max().item()
             if req_emb.size(0) <= max_batch_idx:
-                req_expanded = req_emb[0].unsqueeze(0).expand(x.size(0), -1)
+                req_expanded = req_emb[0].unsqueeze(0).expand(node_emb.size(0), -1)
             else:
                 req_expanded = req_emb[batch]
 
-        # 6. 融合
-        combined = torch.cat([x, req_expanded], dim=-1)
+        # 10. 最终融合
+        combined = torch.cat([node_emb, req_expanded], dim=-1)
         out = self.fusion(combined)
 
         return out

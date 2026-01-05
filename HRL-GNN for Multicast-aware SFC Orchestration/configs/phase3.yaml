@@ -1,111 +1,346 @@
-# 阶段3配置 - 强化学习微调（修复版）
+# ============================================
+# Phase 3 配置 - HRL强化学习 + 黑名单管理系统（时间槽版本）
+# ============================================
+
+# ============================================
+# 1. 阶段3基础配置
+# ============================================
 phase3:
   output_dir: "${project.base_dir}/phase3"
-  episodes: 1000
-  max_steps: 3000000
-  start_epsilon: 0.5  # 🔥 提升初始探索率
-  max_steps_per_episode: 600
-  eval_every: 100
-  eval_episodes: 20
-  save_every: 100
-# 黑名单管理配置
+  num_episodes: 1000              # 训练轮数
+  max_steps: 3000000              # 总步数上限
+  max_steps_per_episode: 600      # 单个Episode最大步数（决策步数，不是时间！）
+  episodes: 2000
+  # 评估配置
+  eval_every: 100                 # 每100个Episode评估一次
+  eval_episodes: 20               # 每次评估运行20个Episode
+  save_every: 100                 # 每100个Episode保存一次
+
+  # 更新频率
+  update_frequency: 4             # 每4步更新一次策略
+
+  # ✅ DAgger配置（智能专家过滤）
+  use_dagger: true
+  beta_start: 0.5                 # 初始专家使用概率
+  beta_end: 0.1                   # 最终专家使用概率
+  beta_min: 0.05                  # 最小beta值
+  beta_decay: 0.995               # 每个Episode后beta衰减率
+
+  # 🔥 新增：时间槽系统配置
+  timeslot:
+    enabled: true                 # 启用时间槽系统
+    delta_t: 0.01                 # 时间槽大小（秒）= 10ms
+    max_time_slots: 200000        # 最大时间槽数
+
+    # 请求持续时间
+    request_duration:
+      min_slots: 1000             # 最小持续时间 = 10s
+      max_slots: 6000             # 最大持续时间 = 60s
+
+    # 统计配置
+    log_timeslot_info: true       # 记录时间槽信息
+    log_jumps: true               # 记录时间槽跳转
+
+# ============================================
+# 2. 黑名单管理配置（核心功能）
+# ============================================
 blacklist:
-  cooldown_base: 5          # 基础冷却时间（步数）
-  cooldown_max: 20          # 最大冷却时间（步数）
-  cooldown_multiplier: 2    # 失败次数增长系数
-  cleanup_interval: 3       # 清理间隔（步数）
-  min_valid_actions: 3      # 最小可用动作数（触发应急清理）
+  # 冷却时间配置
+  cooldown_base: 5                # 首次失败冷却5步
+  cooldown_max: 20                # 最多冷却20步（上限）
+  cooldown_multiplier: 2          # 每次失败时间翻倍（5→10→20）
 
-  # 🔥 探索策略（重点修复）
-  epsilon:
-    initial: 0.3        # 从 50% 探索开始
-    final: 0.05        # 最终保持 5% 探索
-    decay_steps: 50000  # 🔥 500 个 Episode (假设每个 100 步)
+  # 清理策略
+  cleanup_interval: 3             # 每3步清理一次过期黑名单
+  min_valid_actions: 3            # 可用动作少于3个时触发应急清理
 
-  # DAgger配置
-  dagger:
-    initial_beta: 0.5
-    final_beta: 0.1
-    decay_steps: 50000  # 🔥 也相应调整
+  # 资源检查
+  resource_check_margin: 1.1      # 资源检查时留10%余量
 
-  # 早停策略
-  early_stopping:
-    enabled: true
-    patience: 50
-    min_improvement: 0.01
+# ============================================
+# 3. HRL配置（分层强化学习）
+# ============================================
+hrl:
+  # 状态表示
+  state_dim: 128                  # 状态维度
+  goal_dim: 64                    # 目标维度
+  hidden_dim: 128                 # 隐藏层维度
 
-  # 检查点配置
-  checkpoint:
-    save_freq: 25
-    keep_best: true
-    metric: "acceptance_rate"
+  # 子目标配置
+  subgoal_horizon: 20             # 子目标最大持续步数
+  intrinsic_reward_weight: 0.3    # 内在奖励权重
 
-  # 课程学习配置
-  curriculum:
-    use_curriculum: true
-    stages: 3
-    initial_expert_ratio: 0.8
-    final_expert_ratio: 0.0
-    epsilon_decay: 0.995
+  # 目标策略
+  goal_strategy: 'adaptive'       # 自适应目标选择策略
+  max_complexity_threshold: 0.8   # 最大复杂度阈值
 
-  # 🔥 RL特定参数（重要调整）
-  rl:
-    gamma: 0.99
-    replay_buffer:
-      capacity: 100000
-      batch_size: 128      # 🔥 增加到 64
-      min_size: 1000      # 🔥 新增：1000 个样本后开始学习
-    target_update_freq: 200  # 🔥 改成 100 步更新一次
-    learning_rate: 0.0001    # 🔥 新增：学习率
+  # ✅ 自适应Epsilon（黑名单感知）
+  adaptive_epsilon: true          # 启用自适应探索率
+  epsilon_adjustment_factor: 0.3  # 黑名单调整系数（黑名单多→降低探索）
 
-  # Goal-Conditioned HRL 配置
-  hrl:
-    goal_dim: 64
-    subgoal_horizon: 5
-    intrinsic_reward_weight: 0.3
-    max_complexity_threshold: 0.8
-    goal_strategy: 'adaptive'
+# ============================================
+# 4. 探索策略（Epsilon配置）
+# ============================================
+epsilon:
+  # High-Level策略探索
+  high:
+    initial: 0.9                  # 初始探索率30%
+    final: 0.05                   # 最终探索率5%
+    decay_steps: 300000            # 50000步线性衰减
 
-  # configs/phase3.yaml
+  # Low-Level策略探索
+  low:
+    initial: 0.9                  # 初始探索率30%
+    final: 0.05                   # 最终探索率5%
+    decay_steps: 300000            # 50000步线性衰减
+    min: 0.01                     # 最低探索率1%（黑名单感知时的下限）
 
-  # ... 你现有的其他配置 ...
+# ============================================
+# 5. RL训练参数
+# ============================================
+rl:
+  # 基础参数
+  gamma: 0.99                     # 折扣因子
+  learning_rate: 0.0001           # 学习率
 
-  # ============================================
-  # 奖励函数配置
-  # ============================================
+  # 经验回放
+  replay_buffer:
+    capacity: 100000              # 缓冲区容量
+    batch_size: 128               # 批次大小
+    min_size: 1000                # 开始学习的最小样本数
+
+  # 目标网络更新
+  target_update_freq: 200         # 每200步更新目标网络
+
+  # 优化器
+  optimizer: 'adam'               # Adam优化器
+  gradient_clip: 1.0              # 梯度裁剪
+
+# ============================================
+# 6. 奖励函数配置（V5.6版本 + 时间槽增强）
+# ============================================
 reward:
-  # VNF部署
-  vnf_deploy_success: 40.0
-  vnf_all_complete: 50.0
-  vnf_deploy_failed: -30.0
-  move_to_dc_bonus: 5.0
-  move_cost: -0.1
+  # ----------------------------------------
+  # 6.1 VNF部署阶段
+  # ----------------------------------------
+  vnf:
+    deploy_success: 40.0          # 单个VNF部署成功
+    all_complete: 50.0            # 所有VNF部署完成
+    deploy_failed: -30.0          # VNF部署失败
+    move_to_dc_bonus: 5.0         # 移动到DC节点奖励
+    move_cost: -0.5               # 移动成本
 
-  # 树构建
-  connection_base: 50.0
-  connection_exponential: 1.5
-  connection_progress_bonus: 50.0
-  dest_reached_bonus: 30.0
-  full_completion_bonus: 300.0
+  # ----------------------------------------
+  # 6.2 树构建阶段
+  # ----------------------------------------
+  tree:
+    # 连接奖励（指数增长）
+    connection_base: 50.0         # 基础连接奖励
+    connection_exponential: 1.5   # 指数系数（50 * 1.5^n）
+    connection_progress_bonus: 50.0  # 进度奖励
+    dest_reached_bonus: 30.0      # 到达目的地奖励
+    full_completion_bonus: 300.0  # 全部完成奖励
 
-  # 🔥 加强距离引导
-  guidance_closer_rate: 3.0
-  guidance_farther_penalty: -1.0
-  guidance_idle_penalty: -0.5
+    # 距离引导
+    guidance_closer_rate: 3.0     # 靠近目标奖励系数
+    guidance_farther_penalty: -1.0  # 远离目标惩罚
+    guidance_idle_penalty: -0.5   # 原地不动惩罚
 
-  # 惩罚
-  invalid_link: -10.0
-  invalid_action: -15.0
-  wrong_position: -5.0
+  # ----------------------------------------
+  # 6.3 惩罚
+  # ----------------------------------------
+  penalty:
+    invalid_link: -10.0           # 无效链路
+    invalid_action: -15.0         # 无效动作
+    wrong_position: -5.0          # 错误位置
 
-  # 🔥 几乎取消频次惩罚
-  freq_penalty_threshold: 20
-  freq_penalty_rate: -1
+    # ✅ 频次惩罚（轻量化）
+    freq_penalty_threshold: 20    # 访问20次后开始惩罚
+    freq_penalty_rate: -1.0       # 惩罚系数（轻微）
+    hub_penalty_exempt: true      # Hub节点免除频次惩罚
 
-  # 超时
-  timeout_high_progress_threshold: 0.8
-  timeout_bonus_rate: 50.0
-  timeout_penalty_rate: 50.0
-  vnf_timeout_penalty: -50.0
+  # ----------------------------------------
+  # 6.4 超时处理（时间槽增强）
+  # ----------------------------------------
+  timeout:
+    # 🔥 新增：基于时间槽的超时检测
+    enable_timeslot_timeout: true     # 启用时间槽超时检测
+    max_decision_steps: 600           # 最大决策步数（与phase3.max_steps_per_episode一致）
 
-  reward_scale: 1.0
+    # 原有配置
+    high_progress_threshold: 0.8      # 高进度阈值（80%）
+    bonus_rate: 50.0                  # 高进度超时奖励
+    penalty_rate: -50.0               # 低进度超时惩罚
+    vnf_timeout_penalty: -50.0        # VNF阶段超时惩罚
+
+    # 🔥 新增：超时惩罚强化
+    base_timeout_penalty: -300.0      # 基础超时惩罚（更重）
+    resource_waste_penalty: -100.0    # 资源浪费惩罚
+
+  # ----------------------------------------
+  # 6.5 全局配置
+  # ----------------------------------------
+  reward_scale: 1.0               # 奖励缩放因子
+  use_reward_shaping: true        # 启用奖励塑形
+
+# ============================================
+# 7. 环境配置
+# ============================================
+environment:
+  num_nodes: 28                   # 节点数
+  nb_high_level_goals: 10         # High-Level目标数量
+  nb_low_level_actions: 28        # Low-Level动作数（等于节点数）
+
+  # 🔥 新增：时间槽系统
+  time_slot_delta: 0.01           # 时间槽大小（秒）
+  max_steps_per_episode: 600      # 最大决策步数
+
+  # 拓扑配置
+  topology:
+    type: 'us_backbone'           # 拓扑类型
+    dc_nodes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 23]
+
+  # 资源配置
+  capacities:
+    cpu: 100.0                    # CPU容量
+    memory: 80.0                  # 内存容量
+    bandwidth: 100.0              # 带宽容量
+
+# ============================================
+# 8. VNF配置
+# ============================================
+vnf:
+  n_types: 8                      # VNF类型数
+  max_chain_length: 5             # 最大VNF链长度
+
+  # 资源需求（示例）
+  resource_requirements:
+    default_cpu: 1.0
+    default_memory: 1.0
+    default_bandwidth: 1.0
+
+# ============================================
+# 9. 早停策略
+# ============================================
+early_stopping:
+  enabled: true                   # 启用早停
+  patience: 50                    # 容忍50个Episode无改进
+  min_improvement: 0.01           # 最小改进阈值1%
+  metric: 'acceptance_rate'       # 监控指标
+
+# ============================================
+# 10. 检查点配置
+# ============================================
+checkpoint:
+  save_freq: 25                   # 每25个Episode保存一次
+  keep_best: true                 # 保留最佳模型
+  metric: 'acceptance_rate'       # 评估指标
+  save_optimizer: true            # 保存优化器状态
+
+# ============================================
+# 11. 课程学习配置（可选）
+# ============================================
+curriculum:
+  use_curriculum: true            # 启用课程学习
+  stages: 3                       # 3个阶段
+  initial_expert_ratio: 0.8       # 初始专家比例80%
+  final_expert_ratio: 0.0         # 最终专家比例0%
+  stage_episodes: [200, 400, 300] # 每阶段Episode数
+
+# ============================================
+# 12. 日志和监控（时间槽增强）
+# ============================================
+logging:
+  level: 'INFO'                   # 日志级别
+  console: true                   # 控制台输出
+  file: true                      # 文件输出
+  tensorboard: true               # TensorBoard记录
+
+  # 记录频率
+  log_episode_freq: 10            # 每10个Episode记录详细信息
+  log_step_freq: 100              # 每100步记录训练信息
+
+  # 黑名单监控
+  log_blacklist: true             # 记录黑名单信息
+  log_failures: true              # 记录失败统计
+
+  # 🔥 新增：时间槽监控
+  log_timeslot:
+    enabled: true                 # 启用时间槽日志
+    log_jumps: true               # 记录时间槽跳转
+    log_expiry: true              # 记录请求到期
+    log_resource_release: true    # 记录资源释放
+    detail_level: 'normal'        # 详细级别（minimal/normal/verbose）
+
+# ============================================
+# 13. 动态环境配置（服务生命周期 + 时间槽）
+# ============================================
+dynamic_env:
+  enabled: true                   # 启用动态环境
+
+  # 🔥 原有配置（以Episode为单位）
+  service_lifetime_min: 50        # 最小服务生命周期（Episode）
+  service_lifetime_max: 200       # 最大服务生命周期（Episode）
+
+  # 🔥 新增：时间槽版本（以时间槽为单位）
+  timeslot_based_lifetime: true   # 使用时间槽计算生命周期
+  lifetime_min_slots: 1000        # 最小生命周期（时间槽）= 10s
+  lifetime_max_slots: 6000        # 最大生命周期（时间槽）= 60s
+
+# ============================================
+# 14. 路径配置
+# ============================================
+path:
+  input_dir: 'data/input_dir'
+  output_dir: 'outputs/phase3'
+  expert_data_dir: 'data/expert'
+  checkpoint_dir: 'checkpoints/phase3'
+  log_dir: 'logs/phase3'
+  tensorboard_dir: 'runs/phase3'
+
+  # 🔥 新增：时间槽数据文件
+  requests_file: 'phase3_requests.pkl'
+  requests_by_slot_file: 'phase3_requests_by_slot.pkl'
+  events_by_slot_file: 'phase3_events_by_slot.pkl'
+
+# ============================================
+# 15. 项目全局配置
+# ============================================
+project:
+  base_dir: '.'
+  name: 'HRL-GNN-SFC'
+  version: '3.0-timeslot'         # 🔥 版本更新
+  seed: 42                        # 随机种子
+
+# ============================================
+# 16. 🔥 时间槽系统全局配置（新增）
+# ============================================
+timeslot_system:
+  # 基本配置
+  enabled: true                   # 全局启用时间槽系统
+  delta_t: 0.01                   # 时间槽大小（秒）
+  max_time_slots: 200000          # 最大时间槽数
+
+  # 请求管理
+  request_management:
+    batch_processing: true        # 批量处理同时间槽请求
+    max_batch_size: 10            # 最大批量大小
+    enable_priority: false        # 启用优先级队列
+
+  # 资源管理
+  resource_management:
+    auto_release: true            # 自动释放过期资源
+    check_before_allocate: true   # 分配前检查
+    track_by_request: true        # 按请求追踪资源
+
+  # 性能优化
+  optimization:
+    cache_enabled: true           # 启用缓存
+    cache_size: 1000              # 缓存大小
+    skip_empty_slots: true        # 跳过空时间槽
+
+  # 调试与验证
+  debug:
+    validate_timestamps: true     # 验证时间戳一致性
+    check_resource_leak: true     # 检查资源泄漏
+    log_anomalies: true           # 记录异常情况
